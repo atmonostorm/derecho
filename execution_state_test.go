@@ -72,6 +72,10 @@ func (s *minimalStore) GetTimedOutActivities(ctx context.Context, now time.Time)
 	return nil, nil
 }
 
+func (s *minimalStore) ReleaseExpiredWorkflowTasks(ctx context.Context, now time.Time, timeout time.Duration) (int, error) {
+	return 0, nil
+}
+
 func (s *minimalStore) WaitForCompletion(ctx context.Context, workflowID, runID string) (journal.Event, error) {
 	return nil, nil
 }

@@ -154,6 +154,129 @@ func TestBindWorkflowInput_EmptyInput(t *testing.T) {
 	}
 }
 
+func TestProcessWorkflow_CompletionPurgesCache(t *testing.T) {
+	store := NewMemoryStore()
+	cache := newSchedulerCache(10)
+
+	reg := newRegistry("workflow")
+	reg.register("simple", func(ctx Context, input string) (string, error) {
+		return "done", nil
+	})
+
+	w := &workflowWorker{
+		store:    store,
+		cache:    cache,
+		resolver: reg,
+		workerID: "test-worker",
+		codec:    DefaultCodec,
+		logger:   testLogger(),
+	}
+
+	ctx := t.Context()
+	_, err := store.CreateWorkflow(ctx, "wf-1", "simple", []byte(`"hello"`), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := store.WaitForWorkflowTasks(ctx, "test-worker", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.processWorkflow(ctx, tasks[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	if cache.AvailableSlots() != 10 {
+		t.Error("completed workflow should not remain in cache")
+	}
+}
+
+func TestProcessWorkflow_CachedCompletionClosesScheduler(t *testing.T) {
+	store := NewMemoryStore()
+	cache := newSchedulerCache(10)
+
+	actRef := NewActivityRef[string, string]("greet")
+
+	reg := newRegistry("workflow")
+	reg.register("with-activity", func(ctx Context, input string) (string, error) {
+		future := actRef.Execute(ctx, input)
+		return future.Get(ctx)
+	})
+
+	w := &workflowWorker{
+		store:    store,
+		cache:    cache,
+		resolver: reg,
+		workerID: "test-worker",
+		codec:    DefaultCodec,
+		logger:   testLogger(),
+	}
+
+	ctx := t.Context()
+	runID, err := store.CreateWorkflow(ctx, "wf-1", "with-activity", []byte(`"world"`), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := store.WaitForWorkflowTasks(ctx, "test-worker", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.processWorkflow(ctx, tasks[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	// Scheduler should be cached (workflow blocked on activity)
+	cached := cache.Get("wf-1", runID)
+	if cached == nil {
+		t.Fatal("expected scheduler to be cached after scheduling activity")
+	}
+	sched := cached.sched
+	cache.Put("wf-1", runID, cached)
+
+	// Find the ActivityScheduled event ID
+	events, _ := store.Load(ctx, "wf-1", runID)
+	var scheduledID int
+	for _, ev := range events {
+		if as, ok := ev.(journal.ActivityScheduled); ok {
+			scheduledID = as.Base().ID
+			break
+		}
+	}
+	if scheduledID == 0 {
+		t.Fatal("ActivityScheduled event not found")
+	}
+
+	// Complete the activity and schedule a new workflow task
+	resultJSON, _ := json.Marshal("hello world")
+	store.Append(ctx, "wf-1", runID, []journal.Event{
+		journal.ActivityCompleted{
+			BaseEvent: journal.BaseEvent{ScheduledByID: scheduledID},
+			Result:    resultJSON,
+		},
+	}, 0)
+	store.Append(ctx, "wf-1", runID, []journal.Event{
+		journal.WorkflowTaskScheduled{},
+	}, 0)
+
+	// Process the second task (cache hit path, workflow completes)
+	tasks, err = store.WaitForWorkflowTasks(ctx, "test-worker", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.processWorkflow(ctx, tasks[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	if sched.fibers != nil {
+		t.Error("scheduler fibers should be nil after workflow completion")
+	}
+	if cache.AvailableSlots() != 10 {
+		t.Error("completed workflow should not remain in cache")
+	}
+}
+
 func TestValidateSignature(t *testing.T) {
 	tests := []struct {
 		name    string

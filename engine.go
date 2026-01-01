@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"time"
 
 	"github.com/atmonostorm/derecho/journal"
 )
@@ -20,25 +21,27 @@ type Engine struct {
 	workflowRegistry *Registry
 	activityRegistry *Registry
 
-	cache              *schedulerCache
-	workerID           string
-	codec              Codec
-	clock              Clock
-	defaultRetryPolicy *RetryPolicy
-	workerConcurrency  int
-	logger             *slog.Logger
+	cache               *schedulerCache
+	workerID            string
+	codec               Codec
+	clock               Clock
+	defaultRetryPolicy  *RetryPolicy
+	workerConcurrency   int
+	workflowTaskTimeout time.Duration
+	logger              *slog.Logger
 }
 
 type engineConfig struct {
-	workerID           string
-	cacheSize          int
-	codec              Codec
-	clock              Clock
-	workflowResolver   WorkflowResolver
-	activityResolver   ActivityResolver
-	defaultRetryPolicy *RetryPolicy
-	workerConcurrency  int
-	logger             *slog.Logger
+	workerID            string
+	cacheSize           int
+	codec               Codec
+	clock               Clock
+	workflowResolver    WorkflowResolver
+	activityResolver    ActivityResolver
+	defaultRetryPolicy  *RetryPolicy
+	workerConcurrency   int
+	workflowTaskTimeout time.Duration
+	logger              *slog.Logger
 }
 
 type EngineOption func(*engineConfig)
@@ -97,6 +100,14 @@ func WithWorkerConcurrency(n int) EngineOption {
 	}
 }
 
+// WithWorkflowTaskTimeout sets the lease duration for workflow tasks.
+// Expired tasks are released for reprocessing; leases are not renewed.
+func WithWorkflowTaskTimeout(d time.Duration) EngineOption {
+	return func(c *engineConfig) {
+		c.workflowTaskTimeout = d
+	}
+}
+
 // WithEngineLogger sets the logger for the engine and its workers.
 func WithEngineLogger(l *slog.Logger) EngineOption {
 	return func(c *engineConfig) {
@@ -106,11 +117,12 @@ func WithEngineLogger(l *slog.Logger) EngineOption {
 
 func NewEngine(store journal.Store, opts ...EngineOption) (*Engine, error) {
 	cfg := engineConfig{
-		workerID:          randomID(),
-		cacheSize:         defaultCacheSize,
-		codec:             DefaultCodec,
-		clock:             RealClock{},
-		workerConcurrency: 5,
+		workerID:            randomID(),
+		cacheSize:           defaultCacheSize,
+		codec:               DefaultCodec,
+		clock:               RealClock{},
+		workerConcurrency:   5,
+		workflowTaskTimeout: 10 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -121,14 +133,15 @@ func NewEngine(store journal.Store, opts ...EngineOption) (*Engine, error) {
 	}
 
 	e := &Engine{
-		store:              store,
-		cache:              newSchedulerCache(cfg.cacheSize),
-		workerID:           cfg.workerID,
-		codec:              cfg.codec,
-		clock:              cfg.clock,
-		defaultRetryPolicy: cfg.defaultRetryPolicy,
-		workerConcurrency:  cfg.workerConcurrency,
-		logger:             cfg.logger,
+		store:               store,
+		cache:               newSchedulerCache(cfg.cacheSize),
+		workerID:            cfg.workerID,
+		codec:               cfg.codec,
+		clock:               cfg.clock,
+		defaultRetryPolicy:  cfg.defaultRetryPolicy,
+		workerConcurrency:   cfg.workerConcurrency,
+		workflowTaskTimeout: cfg.workflowTaskTimeout,
+		logger:              cfg.logger,
 	}
 
 	if cfg.workflowResolver != nil {
@@ -234,7 +247,7 @@ func (e *Engine) TimerWorker() *timerWorker {
 }
 
 func (e *Engine) TimeoutWorker() *timeoutWorker {
-	return &timeoutWorker{store: e.store, clock: e.clock}
+	return &timeoutWorker{store: e.store, clock: e.clock, workflowTaskTimeout: e.workflowTaskTimeout}
 }
 
 type Worker interface {

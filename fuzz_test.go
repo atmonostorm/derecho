@@ -572,6 +572,10 @@ func (fs *fuzzStore) GetTimedOutActivities(ctx context.Context, now time.Time) (
 	return nil, nil
 }
 
+func (fs *fuzzStore) ReleaseExpiredWorkflowTasks(ctx context.Context, now time.Time, timeout time.Duration) (int, error) {
+	return 0, nil
+}
+
 func (fs *fuzzStore) WaitForCompletion(ctx context.Context, workflowID, runID string) (journal.Event, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()

@@ -151,11 +151,10 @@ func (w *activityWorker) processActivity(ctx context.Context, task journal.Pendi
 
 	resultEvent = resultEvent.WithScheduledByID(task.ScheduledAt)
 
-	if _, err := w.store.Append(ctx, task.WorkflowID, task.RunID, []journal.Event{resultEvent}, 0); err != nil {
-		return err
-	}
-
+	// Append the completion and the follow-up workflow task in a single transaction.
+	// This avoids a crash window between completion and scheduling.
 	_, err := w.store.Append(ctx, task.WorkflowID, task.RunID, []journal.Event{
+		resultEvent,
 		journal.WorkflowTaskScheduled{},
 	}, 0)
 	return err

@@ -13,6 +13,7 @@ func testWorkflowTasks(t *testing.T, factory Factory) {
 	t.Run("TaskConsumedOnce", testTaskConsumedOnce(factory))
 	t.Run("MultipleWorkflows", testMultipleWorkflows(factory))
 	t.Run("RescheduledTask", testRescheduledTask(factory))
+	t.Run("TaskReclaimedAfterTimeout", testTaskReclaimedAfterTimeout(factory))
 	t.Run("ConcurrentWorkflowCreation", testConcurrentWorkflowCreation(factory))
 }
 
@@ -167,6 +168,72 @@ func testRescheduledTask(factory Factory) func(t *testing.T) {
 		}
 		if tasks[0].ScheduledAt != 7 {
 			t.Errorf("ScheduledAt = %d, want 7", tasks[0].ScheduledAt)
+		}
+	}
+}
+
+func testTaskReclaimedAfterTimeout(factory Factory) func(t *testing.T) {
+	return func(t *testing.T) {
+		store, clock := newTestStore(t, factory)
+		ctx := context.Background()
+
+		runID, err := store.CreateWorkflow(ctx, "wf-1", "TestWorkflow", nil, baseTime)
+		if err != nil {
+			t.Fatalf("CreateWorkflow failed: %v", err)
+		}
+
+		ctx1, cancel1 := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel1()
+
+		firstTasks, err := store.WaitForWorkflowTasks(ctx1, "worker-1", 10)
+		if err != nil {
+			t.Fatalf("first WaitForWorkflowTasks failed: %v", err)
+		}
+		if len(firstTasks) != 1 {
+			t.Fatalf("expected 1 task on first claim, got %d", len(firstTasks))
+		}
+		firstStartedAt := firstTasks[0].StartedAt
+		if firstStartedAt.IsZero() {
+			t.Fatal("expected StartedAt on first claim")
+		}
+
+		timeout := 10 * time.Second
+		clock.Advance(timeout + time.Second)
+
+		released, err := store.ReleaseExpiredWorkflowTasks(ctx, clock.Now(), timeout)
+		if err != nil {
+			t.Fatalf("ReleaseExpiredWorkflowTasks failed: %v", err)
+		}
+		if released != 1 {
+			t.Fatalf("expected 1 released task, got %d", released)
+		}
+
+		ctx2, cancel2 := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel2()
+
+		secondTasks, err := store.WaitForWorkflowTasks(ctx2, "worker-2", 10)
+		if err != nil {
+			t.Fatalf("second WaitForWorkflowTasks failed: %v", err)
+		}
+		if len(secondTasks) != 1 {
+			t.Fatalf("expected 1 task on reclaim, got %d", len(secondTasks))
+		}
+		if !secondTasks[0].StartedAt.Equal(firstStartedAt) {
+			t.Fatalf("StartedAt changed on reclaim: got %v, want %v", secondTasks[0].StartedAt, firstStartedAt)
+		}
+
+		events, err := store.Load(ctx, "wf-1", runID)
+		if err != nil {
+			t.Fatalf("Load failed: %v", err)
+		}
+		startedCount := 0
+		for _, ev := range events {
+			if ev.EventType() == journal.TypeWorkflowTaskStarted {
+				startedCount++
+			}
+		}
+		if startedCount != 1 {
+			t.Fatalf("expected 1 WorkflowTaskStarted event, got %d", startedCount)
 		}
 	}
 }

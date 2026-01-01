@@ -67,15 +67,19 @@ type Store interface {
 	// Blocking: If no tasks match (1) or (2), blocks until a matching task arrives
 	// or ctx is cancelled. This provides backpressure when workers are at capacity.
 	//
-	// Atomicity: Appends WorkflowTaskStarted for each returned task. The event ID
-	// is the next available (not necessarily ScheduledAt + 1, since completions
-	// may have been appended after scheduling).
+	// Atomicity: On first claim, appends WorkflowTaskStarted for each returned task.
+	// The event ID is the next available (not necessarily ScheduledAt + 1, since
+	// completions may have been appended after scheduling). Reclaimed tasks return
+	// the original StartedAt without appending a new event.
 	WaitForWorkflowTasks(ctx context.Context, workerID string, maxNew int) ([]PendingWorkflowTask, error)
 	// WaitForActivityTasks blocks until activity tasks are available, then claims
 	// up to maxActivities. Low values (e.g., 1) prevent one worker from starving others.
 	WaitForActivityTasks(ctx context.Context, workerID string, maxActivities int) ([]PendingActivityTask, error)
 	GetTimersToFire(ctx context.Context, now time.Time) ([]PendingTimerTask, error)
 	GetTimedOutActivities(ctx context.Context, now time.Time) ([]TimedOutActivity, error)
+	// ReleaseExpiredWorkflowTasks releases claimed workflow tasks whose lease has expired.
+	// Returns the number of tasks released back to the queue.
+	ReleaseExpiredWorkflowTasks(ctx context.Context, now time.Time, timeout time.Duration) (int, error)
 	WaitForCompletion(ctx context.Context, workflowID, runID string) (Event, error)
 
 	// GetStatus returns the current workflow status without blocking.

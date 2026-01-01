@@ -9,8 +9,9 @@ import (
 )
 
 type timeoutWorker struct {
-	store journal.Store
-	clock Clock
+	store               journal.Store
+	clock               Clock
+	workflowTaskTimeout time.Duration
 }
 
 func (w *timeoutWorker) Process(ctx context.Context) error {
@@ -22,6 +23,12 @@ func (w *timeoutWorker) Process(ctx context.Context) error {
 
 	for _, to := range timedOut {
 		if err := w.processTimeout(ctx, to); err != nil {
+			return err
+		}
+	}
+
+	if w.workflowTaskTimeout > 0 {
+		if _, err := w.store.ReleaseExpiredWorkflowTasks(ctx, now, w.workflowTaskTimeout); err != nil {
 			return err
 		}
 	}

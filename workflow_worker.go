@@ -50,7 +50,6 @@ func (w *workflowWorker) Process(ctx context.Context) error {
 				"workflow_id", task.WorkflowID,
 				"run_id", task.RunID,
 				"error", err)
-			w.cache.Remove(task.WorkflowID, task.RunID)
 		}
 	}
 	return nil
@@ -79,6 +78,13 @@ func (w *workflowWorker) processWorkflow(ctx context.Context, task journal.Pendi
 
 	var sched *Scheduler
 	var state *executionState
+	// Get() removes from cache, so we own the scheduler until Put() or Close().
+	putBack := false
+	defer func() {
+		if !putBack && sched != nil {
+			sched.Close()
+		}
+	}()
 
 	if cached != nil {
 		sched = cached.sched
@@ -150,8 +156,6 @@ func (w *workflowWorker) processWorkflow(ctx context.Context, task journal.Pendi
 			"workflow_id", task.WorkflowID,
 			"run_id", task.RunID,
 			"error", err)
-		w.cache.Remove(task.WorkflowID, task.RunID)
-		sched.Close()
 		return err
 	}
 
@@ -164,13 +168,10 @@ func (w *workflowWorker) processWorkflow(ctx context.Context, task journal.Pendi
 	}
 
 	pendingEvents := state.PendingEvents()
-	completed := w.isWorkflowCompleted(pendingEvents)
-	if completed {
-		w.cache.Remove(task.WorkflowID, task.RunID)
-	} else {
+	if !w.isWorkflowCompleted(pendingEvents) {
 		cs := &cachedScheduler{sched: sched, state: state}
-		if !w.cache.Put(task.WorkflowID, task.RunID, cs) {
-			sched.Close()
+		if w.cache.Put(task.WorkflowID, task.RunID, cs) {
+			putBack = true
 		}
 	}
 
@@ -180,7 +181,7 @@ func (w *workflowWorker) processWorkflow(ctx context.Context, task journal.Pendi
 func (w *workflowWorker) isWorkflowCompleted(events []journal.Event) bool {
 	for _, ev := range events {
 		switch ev.(type) {
-		case journal.WorkflowCompleted, journal.WorkflowFailed, journal.WorkflowCancelled:
+		case journal.WorkflowCompleted, journal.WorkflowFailed, journal.WorkflowCancelled, journal.WorkflowContinuedAsNew:
 			return true
 		}
 	}
