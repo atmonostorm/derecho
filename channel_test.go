@@ -494,6 +494,38 @@ func TestChannel_SchedulerDeterminism(t *testing.T) {
 	}
 }
 
+func TestChannel_CloseUnblocksSenders(t *testing.T) {
+	state := NewStubExecutionState()
+
+	wf := func(ctx Context) {
+		ch := NewChannel[int](ctx)
+
+		Go(ctx, func(ctx Context) {
+			ch.Send(ctx, 42)
+		})
+
+		Await(ctx, func() bool { return len(ch.sendWaiters) > 0 })
+
+		ch.Close(ctx)
+	}
+
+	s := NewScheduler(state, wf, testWorkflowInfo())
+	if err := s.Advance(t.Context(), 0, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(state.Events()) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(state.Events()))
+	}
+	ev, ok := state.Events()[0].(journal.WorkflowFailed)
+	if !ok {
+		t.Fatalf("expected WorkflowFailed, got %T", state.Events()[0])
+	}
+	if !strings.Contains(ev.Error.Message, "send on closed channel") {
+		t.Errorf("expected panic about send on closed channel, got: %s", ev.Error.Message)
+	}
+}
+
 func TestChannel_HighConcurrencyReplay(t *testing.T) {
 	store := NewMemoryStore()
 	engine := mustEngine(t, store)

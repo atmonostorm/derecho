@@ -125,6 +125,8 @@ func (r *workflowRun) Get(ctx context.Context, result any, opts ...GetOption) er
 		return e.Error
 	case journal.WorkflowCancelled:
 		return ErrCancelled
+	case journal.WorkflowContinuedAsNew:
+		return ErrContinuedAsNew
 	default:
 		return fmt.Errorf("derecho: unexpected completion event type: %T", ev)
 	}

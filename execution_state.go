@@ -10,7 +10,7 @@ import (
 // ExecutionState feeds events to the scheduler and manages visibility
 // for deterministic replay of a single workflow execution.
 type ExecutionState interface {
-	NewRecorder(afterEventID int) Recorder
+	NewRecorder(workflowTaskScheduledID int) Recorder
 	GetByScheduledID(scheduledEventID int) []journal.Event
 	GetSignals(signalName string) []journal.SignalReceived
 	GetCancelRequest() *journal.WorkflowCancelRequested

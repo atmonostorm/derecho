@@ -5,35 +5,41 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/atmonostorm/derecho/journal"
 )
 
+type workflowKey struct {
+	workflowID string
+	runID      string
+}
+
 type MemoryStore struct {
 	mu                sync.Mutex
-	cond              *sync.Cond
-	events            map[string][]journal.Event
-	lastEventID       map[string]int
-	processedTasks    map[string]map[int]bool
+	events            map[workflowKey][]journal.Event
+	lastEventID       map[workflowKey]int
+	processedTasks    map[workflowKey]map[int]bool
 	pending           []pendingWorkflowTask
 	pendingActivities []journal.PendingActivityTask
 	pendingTimers     []journal.PendingTimerTask
-	complete          map[string]chan journal.Event
+	complete          map[workflowKey][]chan journal.Event
 	clock             Clock
 	idGen             func() string
 
+	workflowNotify chan struct{}
+	activityNotify chan struct{}
+
 	// Sticky routing: workflowKey → workerID
-	workerAffinity map[string]string
+	workerAffinity map[workflowKey]string
 
 	// Workflow completion timestamps for ListWorkflows
-	completedAt map[string]time.Time
+	completedAt map[workflowKey]time.Time
 
 	// Child workflow relationship tracking
-	childToParent    map[string]childWorkflowLink // childKey → parent info
-	parentToChildren map[string][]string          // parentKey → []childKey
+	childToParent    map[workflowKey]childWorkflowLink // childKey → parent info
+	parentToChildren map[workflowKey][]workflowKey     // parentKey → []childKey
 }
 
 type childWorkflowLink struct {
@@ -70,18 +76,19 @@ func WithIDGenerator(gen func() string) MemoryStoreOption {
 
 func NewMemoryStore(opts ...MemoryStoreOption) *MemoryStore {
 	ms := &MemoryStore{
-		events:           make(map[string][]journal.Event),
-		lastEventID:      make(map[string]int),
-		processedTasks:   make(map[string]map[int]bool),
-		complete:         make(map[string]chan journal.Event),
+		events:           make(map[workflowKey][]journal.Event),
+		lastEventID:      make(map[workflowKey]int),
+		processedTasks:   make(map[workflowKey]map[int]bool),
+		complete:         make(map[workflowKey][]chan journal.Event),
 		clock:            RealClock{},
 		idGen:            randomID,
-		workerAffinity:   make(map[string]string),
-		completedAt:      make(map[string]time.Time),
-		childToParent:    make(map[string]childWorkflowLink),
-		parentToChildren: make(map[string][]string),
+		workflowNotify:   make(chan struct{}, 1),
+		activityNotify:   make(chan struct{}, 1),
+		workerAffinity:   make(map[workflowKey]string),
+		completedAt:      make(map[workflowKey]time.Time),
+		childToParent:    make(map[workflowKey]childWorkflowLink),
+		parentToChildren: make(map[workflowKey][]workflowKey),
 	}
-	ms.cond = sync.NewCond(&ms.mu)
 	for _, opt := range opts {
 		opt(ms)
 	}
@@ -90,18 +97,37 @@ func NewMemoryStore(opts ...MemoryStoreOption) *MemoryStore {
 
 func randomID() string {
 	var b [16]byte
-	rand.Read(b[:])
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("derecho: entropy source failed: " + err.Error())
+	}
 	return hex.EncodeToString(b[:])
 }
 
-func (ms *MemoryStore) key(workflowID, runID string) string {
-	return journal.WorkflowKey(workflowID, runID)
+func (ms *MemoryStore) key(wfID, runID string) workflowKey {
+	return workflowKey{workflowID: wfID, runID: runID}
+}
+
+func (ms *MemoryStore) pokeWorkflow() {
+	select {
+	case ms.workflowNotify <- struct{}{}:
+	default:
+	}
+}
+
+func (ms *MemoryStore) pokeActivity() {
+	select {
+	case ms.activityNotify <- struct{}{}:
+	default:
+	}
 }
 
 func (ms *MemoryStore) Load(ctx context.Context, workflowID, runID string) ([]journal.Event, error) {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	return ms.events[ms.key(workflowID, runID)], nil
+	all := ms.events[ms.key(workflowID, runID)]
+	result := make([]journal.Event, len(all))
+	copy(result, all)
+	return result, nil
 }
 
 func (ms *MemoryStore) LoadFrom(ctx context.Context, workflowID, runID string, afterEventID int) ([]journal.Event, error) {
@@ -223,151 +249,141 @@ func (ms *MemoryStore) Append(ctx context.Context, workflowID, runID string, eve
 		case journal.TypeWorkflowCompleted, journal.TypeWorkflowFailed, journal.TypeWorkflowCancelled:
 			ms.handleWorkflowCompletion(workflowID, runID, ev)
 			delete(ms.workerAffinity, key)
-			if ch, ok := ms.complete[key]; ok {
-				ch <- ev
-			}
+			ms.notifyCompletionWaiters(key, ev)
 		case journal.TypeWorkflowContinuedAsNew:
 			continued := ev.(journal.WorkflowContinuedAsNew)
 			ms.spawnContinuedRun(workflowID, runID, continued)
 			delete(ms.workerAffinity, key)
-			if ch, ok := ms.complete[key]; ok {
-				ch <- ev
-			}
+			ms.notifyCompletionWaiters(key, ev)
 		case journal.TypeSignalExternalScheduled:
 			scheduled := ev.(journal.SignalExternalScheduled)
 			ms.deliverSignalToWorkflow(scheduled.TargetWorkflowID, scheduled.SignalName, scheduled.Payload)
 		}
 	}
 
-	ms.cond.Broadcast()
+	ms.pokeWorkflow()
+	ms.pokeActivity()
 	return eventIDs, nil
 }
 
 func (ms *MemoryStore) WaitForWorkflowTasks(ctx context.Context, workerID string, maxNew int) ([]journal.PendingWorkflowTask, error) {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			ms.cond.Broadcast()
-		case <-done:
-		}
-	}()
-	defer close(done)
-
 	for {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
+		ms.mu.Lock()
+		result := ms.tryClaimWorkflowTasks(workerID, maxNew)
+		ms.mu.Unlock()
 
-		var matchedIdx, unassignedIdx []int
-		for i, task := range ms.pending {
-			if task.Claimed {
-				continue
-			}
-			key := ms.key(task.WorkflowID, task.RunID)
-			if ms.workerAffinity[key] == workerID {
-				matchedIdx = append(matchedIdx, i)
-			} else if ms.workerAffinity[key] == "" {
-				unassignedIdx = append(unassignedIdx, i)
-			}
-		}
-
-		newCount := min(maxNew, len(unassignedIdx))
-		toClaimIdx := append(matchedIdx, unassignedIdx[:newCount]...)
-
-		if len(toClaimIdx) > 0 {
-			now := ms.clock.Now()
-			result := make([]journal.PendingWorkflowTask, len(toClaimIdx))
-
-			for i, idx := range toClaimIdx {
-				task := &ms.pending[idx]
-				key := ms.key(task.WorkflowID, task.RunID)
-				ms.workerAffinity[key] = workerID
-
-				task.Claimed = true
-				task.ClaimedBy = workerID
-				task.ClaimedAt = now
-
-				if task.StartedAt.IsZero() {
-					task.StartedAt = now
-					startedID := ms.lastEventID[key] + 1
-					ms.events[key] = append(ms.events[key], journal.WorkflowTaskStarted{
-						BaseEvent: journal.BaseEvent{ID: startedID, ScheduledByID: task.ScheduledAt},
-						WorkerID:  workerID,
-						StartedAt: task.StartedAt,
-					})
-					ms.lastEventID[key] = startedID
-				}
-
-				result[i] = journal.PendingWorkflowTask{
-					WorkflowID:  task.WorkflowID,
-					RunID:       task.RunID,
-					ScheduledAt: task.ScheduledAt,
-					StartedAt:   task.StartedAt,
-				}
-			}
+		if len(result) > 0 {
 			return result, nil
 		}
 
-		ms.cond.Wait()
+		select {
+		case <-ms.workflowNotify:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 
-func (ms *MemoryStore) WaitForActivityTasks(ctx context.Context, workerID string, maxActivities int) ([]journal.PendingActivityTask, error) {
-	ms.mu.Lock()
-	defer ms.mu.Unlock()
-
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			ms.cond.Broadcast()
-		case <-done:
+func (ms *MemoryStore) tryClaimWorkflowTasks(workerID string, maxNew int) []journal.PendingWorkflowTask {
+	var matchedIdx, unassignedIdx []int
+	for i, task := range ms.pending {
+		if task.Claimed {
+			continue
 		}
-	}()
-	defer close(done)
+		key := ms.key(task.WorkflowID, task.RunID)
+		if ms.workerAffinity[key] == workerID {
+			matchedIdx = append(matchedIdx, i)
+		} else {
+			unassignedIdx = append(unassignedIdx, i)
+		}
+	}
 
+	newCount := min(maxNew, len(unassignedIdx))
+	toClaimIdx := append(matchedIdx, unassignedIdx[:newCount]...)
+
+	if len(toClaimIdx) == 0 {
+		return nil
+	}
+
+	now := ms.clock.Now()
+	result := make([]journal.PendingWorkflowTask, len(toClaimIdx))
+
+	for i, idx := range toClaimIdx {
+		task := &ms.pending[idx]
+		key := ms.key(task.WorkflowID, task.RunID)
+		ms.workerAffinity[key] = workerID
+
+		task.Claimed = true
+		task.ClaimedBy = workerID
+		task.ClaimedAt = now
+
+		if task.StartedAt.IsZero() {
+			task.StartedAt = now
+			startedID := ms.lastEventID[key] + 1
+			ms.events[key] = append(ms.events[key], journal.WorkflowTaskStarted{
+				BaseEvent: journal.BaseEvent{ID: startedID, ScheduledByID: task.ScheduledAt},
+				WorkerID:  workerID,
+				StartedAt: task.StartedAt,
+			})
+			ms.lastEventID[key] = startedID
+		}
+
+		result[i] = journal.PendingWorkflowTask{
+			WorkflowID:  task.WorkflowID,
+			RunID:       task.RunID,
+			ScheduledAt: task.ScheduledAt,
+			StartedAt:   task.StartedAt,
+		}
+	}
+	return result
+}
+
+func (ms *MemoryStore) WaitForActivityTasks(ctx context.Context, workerID string, maxActivities int) ([]journal.PendingActivityTask, error) {
 	for {
-		if ctx.Err() != nil {
+		ms.mu.Lock()
+		result := ms.tryClaimActivityTasks(maxActivities)
+		ms.mu.Unlock()
+
+		if len(result) > 0 {
+			return result, nil
+		}
+
+		select {
+		case <-ms.activityNotify:
+		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
-
-		now := ms.clock.Now()
-		var ready []journal.PendingActivityTask
-
-		for i := range ms.pendingActivities {
-			if maxActivities > 0 && len(ready) >= maxActivities {
-				break
-			}
-			task := &ms.pendingActivities[i]
-			if task.Claimed {
-				continue
-			}
-			if task.NotBefore.IsZero() || !task.NotBefore.After(now) {
-				task.Claimed = true
-				task.StartedTime = now
-				if tp := task.TimeoutPolicy; tp != nil {
-					if tp.StartToCloseTimeout > 0 {
-						task.StartToCloseDeadline = now.Add(tp.StartToCloseTimeout)
-					}
-					if tp.HeartbeatTimeout > 0 {
-						task.HeartbeatTimeout = tp.HeartbeatTimeout
-						task.HeartbeatDeadline = now.Add(tp.HeartbeatTimeout)
-					}
-				}
-				ready = append(ready, *task)
-			}
-		}
-
-		if len(ready) > 0 {
-			return ready, nil
-		}
-
-		ms.cond.Wait()
 	}
+}
+
+func (ms *MemoryStore) tryClaimActivityTasks(maxActivities int) []journal.PendingActivityTask {
+	now := ms.clock.Now()
+	var ready []journal.PendingActivityTask
+
+	for i := range ms.pendingActivities {
+		if maxActivities > 0 && len(ready) >= maxActivities {
+			break
+		}
+		task := &ms.pendingActivities[i]
+		if task.Claimed {
+			continue
+		}
+		if task.NotBefore.IsZero() || !task.NotBefore.After(now) {
+			task.Claimed = true
+			task.StartedTime = now
+			if tp := task.TimeoutPolicy; tp != nil {
+				if tp.StartToCloseTimeout > 0 {
+					task.StartToCloseDeadline = now.Add(tp.StartToCloseTimeout)
+				}
+				if tp.HeartbeatTimeout > 0 {
+					task.HeartbeatTimeout = tp.HeartbeatTimeout
+					task.HeartbeatDeadline = now.Add(tp.HeartbeatTimeout)
+				}
+			}
+			ready = append(ready, *task)
+		}
+	}
+	return ready
 }
 
 func (ms *MemoryStore) GetTimersToFire(ctx context.Context, now time.Time) ([]journal.PendingTimerTask, error) {
@@ -437,7 +453,7 @@ func (ms *MemoryStore) ReleaseExpiredWorkflowTasks(ctx context.Context, now time
 	}
 
 	if released > 0 {
-		ms.cond.Broadcast()
+		ms.pokeWorkflow()
 	}
 
 	return released, nil
@@ -469,19 +485,17 @@ func (ms *MemoryStore) checkActivityTimeout(task journal.PendingActivityTask, no
 func (ms *MemoryStore) WaitForCompletion(ctx context.Context, workflowID, runID string) (journal.Event, error) {
 	ms.mu.Lock()
 	key := ms.key(workflowID, runID)
-	ch, ok := ms.complete[key]
-	if !ok {
-		ch = make(chan journal.Event, 1)
-		ms.complete[key] = ch
-	}
 
 	for _, ev := range ms.events[key] {
 		switch ev.EventType() {
-		case journal.TypeWorkflowCompleted, journal.TypeWorkflowFailed, journal.TypeWorkflowCancelled:
+		case journal.TypeWorkflowCompleted, journal.TypeWorkflowFailed, journal.TypeWorkflowCancelled, journal.TypeWorkflowContinuedAsNew:
 			ms.mu.Unlock()
 			return ev, nil
 		}
 	}
+
+	ch := make(chan journal.Event, 1)
+	ms.complete[key] = append(ms.complete[key], ch)
 	ms.mu.Unlock()
 
 	select {
@@ -489,6 +503,14 @@ func (ms *MemoryStore) WaitForCompletion(ctx context.Context, workflowID, runID 
 		return ev, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+}
+
+func (ms *MemoryStore) notifyCompletionWaiters(key workflowKey, ev journal.Event) {
+	waiters := ms.complete[key]
+	delete(ms.complete, key)
+	for _, ch := range waiters {
+		ch <- ev
 	}
 }
 
@@ -587,15 +609,14 @@ func (ms *MemoryStore) RequeueForRetry(ctx context.Context, workflowID, runID st
 // findRunningWorkflow returns the runID of a running workflow with the given ID,
 // or empty string if none exists or all runs have terminated. Caller must hold ms.mu.
 func (ms *MemoryStore) findRunningWorkflow(workflowID string) string {
-	prefix := workflowID + "/"
 	for key, events := range ms.events {
-		if !strings.HasPrefix(key, prefix) {
+		if key.workflowID != workflowID {
 			continue
 		}
 		if ms.isTerminated(events) {
 			continue
 		}
-		return strings.TrimPrefix(key, prefix)
+		return key.runID
 	}
 	return ""
 }
@@ -714,6 +735,16 @@ func (ms *MemoryStore) spawnContinuedRun(workflowID, oldRunID string, continued 
 	if link, ok := ms.childToParent[oldKey]; ok {
 		delete(ms.childToParent, oldKey)
 		ms.childToParent[newKey] = link
+
+		parentKey := ms.key(link.ParentWorkflowID, link.ParentRunID)
+		if children, ok := ms.parentToChildren[parentKey]; ok {
+			for i, ck := range children {
+				if ck == oldKey {
+					ms.parentToChildren[parentKey][i] = newKey
+					break
+				}
+			}
+		}
 	}
 }
 
@@ -796,7 +827,7 @@ func (ms *MemoryStore) notifyParentOfChildCompletion(link childWorkflowLink, chi
 	})
 }
 
-func (ms *MemoryStore) terminateChild(childKey string) {
+func (ms *MemoryStore) terminateChild(childKey workflowKey) {
 	eventID := ms.lastEventID[childKey] + 1
 	ms.events[childKey] = append(ms.events[childKey], journal.WorkflowFailed{
 		BaseEvent: journal.BaseEvent{ID: eventID},
@@ -804,9 +835,7 @@ func (ms *MemoryStore) terminateChild(childKey string) {
 	})
 	ms.lastEventID[childKey] = eventID
 
-	if ch, ok := ms.complete[childKey]; ok {
-		ch <- ms.events[childKey][len(ms.events[childKey])-1]
-	}
+	ms.notifyCompletionWaiters(childKey, ms.events[childKey][len(ms.events[childKey])-1])
 
 	if grandchildren, ok := ms.parentToChildren[childKey]; ok {
 		for _, grandchildKey := range grandchildren {
@@ -827,10 +856,11 @@ func (ms *MemoryStore) SignalWorkflow(ctx context.Context, workflowID, signalNam
 
 	runID := ms.findActiveRun(workflowID)
 	if runID == "" {
-		return &WorkflowNotFoundError{WorkflowID: workflowID}
+		return &journal.WorkflowNotFoundError{WorkflowID: workflowID}
 	}
 
 	ms.appendSignal(workflowID, runID, signalName, payload)
+	ms.pokeWorkflow()
 	return nil
 }
 
@@ -881,14 +911,13 @@ func (ms *MemoryStore) CreateWorkflow(ctx context.Context, workflowID, workflowT
 		ScheduledAt: 2,
 	})
 
-	ms.cond.Broadcast()
+	ms.pokeWorkflow()
 	return runID, nil
 }
 
 func (ms *MemoryStore) findActiveRun(workflowID string) string {
 	for key, events := range ms.events {
-		keyWorkflowID, keyRunID, ok := strings.Cut(key, "/")
-		if !ok || keyWorkflowID != workflowID {
+		if key.workflowID != workflowID {
 			continue
 		}
 
@@ -900,13 +929,13 @@ func (ms *MemoryStore) findActiveRun(workflowID string) string {
 			}
 		}
 		if isRunning {
-			return keyRunID
+			return key.runID
 		}
 	}
 	return ""
 }
 
-func (ms *MemoryStore) scheduleTaskIfNeeded(workflowID, runID, key string) {
+func (ms *MemoryStore) scheduleTaskIfNeeded(workflowID, runID string, key workflowKey) {
 	for _, task := range ms.pending {
 		if task.WorkflowID == workflowID && task.RunID == runID && !task.Claimed {
 			return
@@ -958,7 +987,7 @@ func (ms *MemoryStore) CancelWorkflow(ctx context.Context, workflowID, reason st
 
 	runID := ms.findActiveRun(workflowID)
 	if runID == "" {
-		return &WorkflowNotFoundError{WorkflowID: workflowID}
+		return &journal.WorkflowNotFoundError{WorkflowID: workflowID}
 	}
 
 	key := ms.key(workflowID, runID)
@@ -973,6 +1002,7 @@ func (ms *MemoryStore) CancelWorkflow(ctx context.Context, workflowID, reason st
 	ms.lastEventID[key] = eventID
 
 	ms.scheduleTaskIfNeeded(workflowID, runID, key)
+	ms.pokeWorkflow()
 	return nil
 }
 
@@ -993,12 +1023,7 @@ func (ms *MemoryStore) ListWorkflows(ctx context.Context, opts ...journal.ListWo
 
 	var executions []journal.WorkflowExecution
 	for key, events := range ms.events {
-		workflowID, runID, ok := strings.Cut(key, "/")
-		if !ok {
-			continue
-		}
-
-		ex := ms.buildWorkflowExecution(workflowID, runID, events)
+		ex := ms.buildWorkflowExecution(key, events)
 
 		if !ms.matchesFilters(ex, o) {
 			continue
@@ -1054,10 +1079,10 @@ func (ms *MemoryStore) ListWorkflows(ctx context.Context, opts ...journal.ListWo
 	return result, nil
 }
 
-func (ms *MemoryStore) buildWorkflowExecution(workflowID, runID string, events []journal.Event) journal.WorkflowExecution {
+func (ms *MemoryStore) buildWorkflowExecution(key workflowKey, events []journal.Event) journal.WorkflowExecution {
 	ex := journal.WorkflowExecution{
-		WorkflowID: workflowID,
-		RunID:      runID,
+		WorkflowID: key.workflowID,
+		RunID:      key.runID,
 		Status:     journal.WorkflowStatusRunning,
 	}
 
@@ -1090,7 +1115,6 @@ func (ms *MemoryStore) buildWorkflowExecution(workflowID, runID string, events [
 		ex.Status = journal.WorkflowStatusCancelling
 	}
 
-	key := ms.key(workflowID, runID)
 	if t, ok := ms.completedAt[key]; ok {
 		ex.CompletedAt = &t
 	}

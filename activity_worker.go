@@ -27,13 +27,7 @@ func (w *activityWorker) Process(ctx context.Context) error {
 
 	for _, task := range pending {
 		if err := w.processActivity(ctx, task); err != nil {
-			// Log the error but don't crash the worker.
-			// Individual activity failures shouldn't bring down the engine.
-			w.logger.Error("derecho: activity processing failed",
-				"workflow_id", task.WorkflowID,
-				"run_id", task.RunID,
-				"activity_name", task.ActivityName,
-				"error", err)
+			return err
 		}
 	}
 	return nil

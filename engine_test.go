@@ -1,11 +1,44 @@
 package derecho_test
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/atmonostorm/derecho"
 	"github.com/atmonostorm/derecho/journal"
 )
+
+type failingActivityStore struct {
+	*derecho.MemoryStore
+	err error
+}
+
+func (s *failingActivityStore) WaitForActivityTasks(ctx context.Context, workerID string, max int) ([]journal.PendingActivityTask, error) {
+	return nil, s.err
+}
+
+func TestEngine_RunReturnsWorkerError(t *testing.T) {
+	sentinel := errors.New("activity store broken")
+	store := &failingActivityStore{
+		MemoryStore: derecho.NewMemoryStore(),
+		err:         sentinel,
+	}
+
+	engine := mustEngine(t, store)
+	derecho.RegisterWorkflow(engine, "noop", func(ctx derecho.Context, _ struct{}) (struct{}, error) {
+		return struct{}{}, nil
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := engine.Run(ctx)
+	if !errors.Is(err, sentinel) {
+		t.Errorf("Run() = %v, want %v", err, sentinel)
+	}
+}
 
 func TestEngine_SimpleWorkflow(t *testing.T) {
 	store := derecho.NewMemoryStore()
@@ -134,5 +167,57 @@ func TestEngine_WorkflowTaskEvents(t *testing.T) {
 	}
 	if completedScheduledBy != taskScheduledID {
 		t.Errorf("WorkflowTaskCompleted.ScheduledByID = %d, want %d", completedScheduledBy, taskScheduledID)
+	}
+}
+
+func TestRun_GetContinuedAsNew(t *testing.T) {
+	store := derecho.NewMemoryStore()
+	engine := mustEngine(t, store)
+
+	derecho.RegisterWorkflow(engine, "looper", func(ctx derecho.Context, n int) (int, error) {
+		return 0, derecho.NewContinueAsNewError(n + 1)
+	})
+
+	client := engine.Client()
+	worker := engine.WorkflowWorker()
+
+	run, err := client.StartWorkflow(t.Context(), "looper", "wf-can", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := worker.Process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	var result int
+	err = run.Get(t.Context(), &result)
+	if !errors.Is(err, derecho.ErrContinuedAsNew) {
+		t.Errorf("Run.Get() = %v, want ErrContinuedAsNew", err)
+	}
+}
+
+func TestEngine_UnknownWorkflowTypeFails(t *testing.T) {
+	store := derecho.NewMemoryStore()
+	engine := mustEngine(t, store)
+
+	client := engine.Client()
+	worker := engine.WorkflowWorker()
+
+	run, err := client.StartWorkflow(t.Context(), "nonexistent", "wf-unk", "hello")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := worker.Process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := store.GetStatus(t.Context(), "wf-unk", run.RunID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != journal.WorkflowStatusFailed {
+		t.Errorf("workflow status = %v, want Failed", status)
 	}
 }

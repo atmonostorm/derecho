@@ -295,6 +295,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.logger.Warn("derecho: worker exited unexpectedly",
 			"worker", result.name)
 	}
+	parentErr := ctx.Err()
 	cancel()
 
 	// Drain remaining errors
@@ -302,8 +303,8 @@ func (e *Engine) Run(ctx context.Context) error {
 		<-errc
 	}
 
-	if ctx.Err() != nil {
-		return ctx.Err()
+	if parentErr != nil {
+		return parentErr
 	}
 	return result.err
 }

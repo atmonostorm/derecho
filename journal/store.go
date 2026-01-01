@@ -3,6 +3,7 @@ package journal
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -182,6 +183,14 @@ type TimedOutActivity struct {
 
 func WorkflowKey(workflowID, runID string) string {
 	return workflowID + "/" + runID
+}
+
+type WorkflowNotFoundError struct {
+	WorkflowID string
+}
+
+func (e *WorkflowNotFoundError) Error() string {
+	return fmt.Sprintf("derecho: workflow %q not found or not running", e.WorkflowID)
 }
 
 var (

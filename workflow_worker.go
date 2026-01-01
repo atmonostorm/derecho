@@ -46,10 +46,7 @@ func (w *workflowWorker) Process(ctx context.Context) error {
 
 	for _, task := range pending {
 		if err := w.processWorkflow(ctx, task); err != nil {
-			w.logger.Error("derecho: workflow processing failed",
-				"workflow_id", task.WorkflowID,
-				"run_id", task.RunID,
-				"error", err)
+			return err
 		}
 	}
 	return nil
@@ -131,7 +128,20 @@ func (w *workflowWorker) processWorkflow(ctx context.Context, task journal.Pendi
 			w.logger.Error("derecho: unknown workflow type",
 				"workflow_id", task.WorkflowID,
 				"workflow_type", startedEvent.WorkflowType)
-			return fmt.Errorf("derecho: unknown workflow type: %s", startedEvent.WorkflowType)
+			if _, err := w.store.Append(ctx, task.WorkflowID, task.RunID, []journal.Event{
+				journal.WorkflowFailed{
+					BaseEvent: journal.BaseEvent{},
+					Error: &journal.Error{
+						Kind:         journal.ErrorKindApplication,
+						Message:      fmt.Sprintf("unknown workflow type: %s", startedEvent.WorkflowType),
+						NonRetryable: true,
+					},
+				},
+				journal.WorkflowTaskScheduled{},
+			}, 0); err != nil {
+				return err
+			}
+			return nil
 		}
 
 		info := WorkflowInfo{

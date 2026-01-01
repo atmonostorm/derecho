@@ -2,20 +2,13 @@ package derecho
 
 import (
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/atmonostorm/derecho/journal"
 )
 
-// WorkflowNotFoundError is returned when signaling a workflow that doesn't exist or isn't running.
-type WorkflowNotFoundError struct {
-	WorkflowID string
-}
-
-func (e *WorkflowNotFoundError) Error() string {
-	return fmt.Sprintf("derecho: workflow %q not found or not running", e.WorkflowID)
-}
+// Alias for backward compat after moving to journal package.
+type WorkflowNotFoundError = journal.WorkflowNotFoundError
 
 // ContinueAsNewError restarts the workflow with fresh history.
 // Use to avoid unbounded event accumulation in long-running workflows.
@@ -81,6 +74,8 @@ func NewTimer(ctx Context, d time.Duration) Future[time.Time] {
 	wctx.registerPendingFuture(pendingIndex, future)
 	return future
 }
+
+var ErrContinuedAsNew = errors.New("derecho: workflow continued as new")
 
 // ErrTimerCancelled is returned by Future.Get when the timer was cancelled.
 var ErrTimerCancelled = errors.New("derecho: timer cancelled")

@@ -76,6 +76,10 @@ func (ch *Channel[T]) Send(ctx Context, value T) {
 	Await(ctx, func() bool {
 		return waiter.ready
 	})
+
+	if ch.closed {
+		panic("derecho: send on closed channel")
+	}
 }
 
 // Receive receives a value. Returns (zero, false) if closed.
@@ -128,12 +132,17 @@ func (ch *Channel[T]) Close(ctx Context) {
 	}
 	ch.closed = true
 
-	hadWaiters := len(ch.recvWaiters) > 0
+	hadWaiters := len(ch.recvWaiters) > 0 || len(ch.sendWaiters) > 0
 	for _, waiter := range ch.recvWaiters {
 		waiter.ok = false
 		waiter.ready = true
 	}
 	ch.recvWaiters = nil
+
+	for _, waiter := range ch.sendWaiters {
+		waiter.ready = true
+	}
+	ch.sendWaiters = nil
 
 	if hadWaiters {
 		ps.signalProgress()
