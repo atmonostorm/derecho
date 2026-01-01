@@ -50,6 +50,15 @@ func (s *StubExecutionState) GetSignals(signalName string) []journal.SignalRecei
 	return result
 }
 
+func (s *StubExecutionState) GetCancelRequest() *journal.WorkflowCancelRequested {
+	for _, ev := range s.events {
+		if cancel, ok := ev.(journal.WorkflowCancelRequested); ok {
+			return &cancel
+		}
+	}
+	return nil
+}
+
 // AddExternalEvent appends an event as if it arrived from outside the workflow.
 func (s *StubExecutionState) AddExternalEvent(ev journal.Event) int {
 	s.lastID++
@@ -68,22 +77,32 @@ func (s *StubExecutionState) NewEvents() []journal.Event {
 }
 
 type stubRecorder struct {
-	state   *StubExecutionState
-	pending []journal.Event
+	state          *StubExecutionState
+	pending        []journal.Event
+	pendingFutures []ScheduledIDReceiver
 }
 
-func (r *stubRecorder) Record(eventType string, generate func() journal.Event) (journal.Event, error) {
+func (r *stubRecorder) Record(eventType string, generate func() journal.Event) (journal.Event, int, error) {
 	event := generate()
 	r.state.lastID++
 	event = event.WithID(r.state.lastID)
+	pendingIndex := len(r.pending)
 	r.pending = append(r.pending, event)
 	r.state.newEvents = append(r.state.newEvents, event)
-	return event, nil
+	return event, pendingIndex, nil
+}
+
+func (r *stubRecorder) RegisterPendingFuture(pendingIndex int, f ScheduledIDReceiver) {
+	for len(r.pendingFutures) <= pendingIndex {
+		r.pendingFutures = append(r.pendingFutures, nil)
+	}
+	r.pendingFutures[pendingIndex] = f
 }
 
 func (r *stubRecorder) Commit(ctx context.Context, scheduledAtTask int) error {
 	r.state.events = append(r.state.events, r.pending...)
 	r.pending = nil
+	r.pendingFutures = nil
 	return nil
 }
 

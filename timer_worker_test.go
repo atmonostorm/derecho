@@ -11,7 +11,7 @@ import (
 func TestTimerWorker_FiresReadyTimers(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	derecho.RegisterWorkflow(engine, "sleeper", func(ctx derecho.Context, _ struct{}) (struct{}, error) {
 		derecho.Sleep(ctx, time.Hour)
@@ -57,7 +57,7 @@ func TestTimerWorker_FiredAtMatchesClockTime(t *testing.T) {
 	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	clock := derecho.NewFakeClock(baseTime)
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	derecho.RegisterWorkflow(engine, "sleeper", func(ctx derecho.Context, _ struct{}) (struct{}, error) {
 		derecho.Sleep(ctx, time.Minute)
@@ -100,7 +100,7 @@ func TestTimerWorker_FiredAtMatchesClockTime(t *testing.T) {
 func TestTimerWorker_TimerNotReadyYet(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	derecho.RegisterWorkflow(engine, "sleeper", func(ctx derecho.Context, _ struct{}) (struct{}, error) {
 		derecho.Sleep(ctx, time.Hour)
@@ -148,7 +148,7 @@ func TestTimerWorker_MultipleTimersSameFireAt(t *testing.T) {
 	baseTime := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 	clock := derecho.NewFakeClock(baseTime)
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	derecho.RegisterWorkflow(engine, "multi-timer", func(ctx derecho.Context, _ struct{}) (struct{}, error) {
 		derecho.NewTimer(ctx, time.Hour)

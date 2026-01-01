@@ -62,6 +62,14 @@ func (w *timerWorker) Process(ctx context.Context) error {
 			return err
 		}
 	}
+
+	if len(pending) == 0 {
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	return nil
 }
 

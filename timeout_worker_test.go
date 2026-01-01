@@ -12,7 +12,7 @@ import (
 func TestTimeoutWorker_ScheduleToStartTimeout(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	derecho.RegisterActivity(engine, "slow", func(ctx context.Context, _ struct{}) (struct{}, error) {
 		return struct{}{}, nil
@@ -67,7 +67,7 @@ func TestTimeoutWorker_ScheduleToStartTimeout(t *testing.T) {
 func TestTimeoutWorker_StartToCloseTimeout_Passive(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	activityStarted := make(chan struct{})
 	activityBlock := make(chan struct{})
@@ -136,7 +136,7 @@ func TestTimeoutWorker_StartToCloseTimeout_Passive(t *testing.T) {
 func TestTimeoutWorker_ScheduleToCloseTimeout(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	derecho.RegisterActivity(engine, "slow", func(ctx context.Context, _ struct{}) (struct{}, error) {
 		return struct{}{}, nil
@@ -193,7 +193,7 @@ func TestTimeoutWorker_ScheduleToCloseTimeout(t *testing.T) {
 func TestTimeoutWorker_NoTimeoutIfActivityCompletes(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	derecho.RegisterActivity(engine, "fast", func(ctx context.Context, _ struct{}) (string, error) {
 		return "done", nil
@@ -247,7 +247,7 @@ func TestTimeoutWorker_NoTimeoutIfActivityCompletes(t *testing.T) {
 func TestTimeoutWorker_RetryStopsWhenScheduleToCloseBudgetExhausted(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	attempts := 0
 	derecho.RegisterActivity(engine, "flaky", func(ctx context.Context, _ struct{}) (struct{}, error) {
@@ -311,7 +311,7 @@ func TestTimeoutWorker_RetryStopsWhenScheduleToCloseBudgetExhausted(t *testing.T
 
 func TestTimeoutWorker_ActiveStartToCloseEnforcement(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	derecho.RegisterActivity(engine, "context-aware", func(ctx context.Context, _ struct{}) (struct{}, error) {
 		<-ctx.Done()
@@ -370,7 +370,7 @@ func TestTimeoutWorker_ActiveStartToCloseEnforcement(t *testing.T) {
 func TestTimeoutWorker_MultipleTimeoutsFirstWins(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	derecho.RegisterActivity(engine, "slow", func(ctx context.Context, _ struct{}) (struct{}, error) {
 		return struct{}{}, nil

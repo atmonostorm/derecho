@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 
 	"github.com/atmonostorm/derecho/journal"
@@ -15,17 +16,24 @@ type activityWorker struct {
 	workerID string
 	codec    Codec
 	clock    Clock
+	logger   *slog.Logger
 }
 
 func (w *activityWorker) Process(ctx context.Context) error {
-	pending, err := w.store.WaitForActivityTasks(ctx, w.workerID)
+	pending, err := w.store.WaitForActivityTasks(ctx, w.workerID, 1)
 	if err != nil {
 		return err
 	}
 
 	for _, task := range pending {
 		if err := w.processActivity(ctx, task); err != nil {
-			return err
+			// Log the error but don't crash the worker.
+			// Individual activity failures shouldn't bring down the engine.
+			w.logger.Error("derecho: activity processing failed",
+				"workflow_id", task.WorkflowID,
+				"run_id", task.RunID,
+				"activity_name", task.ActivityName,
+				"error", err)
 		}
 	}
 	return nil
@@ -34,7 +42,27 @@ func (w *activityWorker) Process(ctx context.Context) error {
 func (w *activityWorker) processActivity(ctx context.Context, task journal.PendingActivityTask) error {
 	fn, ok := w.resolver.ResolveActivity(task.ActivityName)
 	if !ok {
-		return fmt.Errorf("derecho: activity not registered: %s", task.ActivityName)
+		// Activity not registered. Fail it with a non-retryable error so the
+		// workflow can handle it, rather than leaving it stuck in pending.
+		w.logger.Error("derecho: activity not registered",
+			"workflow_id", task.WorkflowID,
+			"activity_name", task.ActivityName)
+
+		failedEvent := journal.ActivityFailed{
+			BaseEvent: journal.BaseEvent{ScheduledByID: task.ScheduledAt},
+			Error: &journal.Error{
+				Kind:         journal.ErrorKindApplication,
+				Message:      fmt.Sprintf("activity not registered: %s", task.ActivityName),
+				NonRetryable: true,
+			},
+		}
+		if _, err := w.store.Append(ctx, task.WorkflowID, task.RunID, []journal.Event{
+			failedEvent,
+			journal.WorkflowTaskScheduled{},
+		}, 0); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	attempt := task.Attempt
@@ -56,7 +84,31 @@ func (w *activityWorker) processActivity(ctx context.Context, task journal.Pendi
 		}
 	}
 
+	w.logger.Debug("derecho: executing activity",
+		"workflow_id", task.WorkflowID,
+		"activity_name", task.ActivityName,
+		"scheduled_at", task.ScheduledAt,
+		"attempt", attempt,
+	)
+
 	resultEvent := w.executeActivity(ctx, fn, task)
+
+	if failed, ok := resultEvent.(journal.ActivityFailed); ok {
+		w.logger.Warn("derecho: activity failed",
+			"workflow_id", task.WorkflowID,
+			"activity_name", task.ActivityName,
+			"scheduled_at", task.ScheduledAt,
+			"attempt", attempt,
+			"error", failed.Error.Message,
+		)
+	} else {
+		w.logger.Debug("derecho: activity completed",
+			"workflow_id", task.WorkflowID,
+			"activity_name", task.ActivityName,
+			"scheduled_at", task.ScheduledAt,
+			"attempt", attempt,
+		)
+	}
 
 	if failed, ok := resultEvent.(journal.ActivityFailed); ok && task.RetryPolicy != nil {
 		errVal := failed.Error

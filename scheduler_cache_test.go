@@ -63,12 +63,16 @@ func TestSchedulerCache_LRUReorder(t *testing.T) {
 	c.Put("wf-1", "run-1", cs1)
 	c.Put("wf-2", "run-2", cs2)
 
-	c.Get("wf-1", "run-1")
+	got := c.Get("wf-1", "run-1")
+	if got != cs1 {
+		t.Fatal("expected to get cs1")
+	}
+	c.Put("wf-1", "run-1", cs1)
 
 	c.Put("wf-3", "run-3", cs3)
 
 	if c.Get("wf-1", "run-1") != cs1 {
-		t.Error("wf-1 should still be cached (recently accessed)")
+		t.Error("wf-1 should still be cached (recently re-added)")
 	}
 	if c.Get("wf-2", "run-2") != nil {
 		t.Error("wf-2 should have been evicted")
@@ -210,5 +214,30 @@ func TestSchedulerCache_CompletedActivityNotHot(t *testing.T) {
 
 	if c.Get("wf1", "run") != nil {
 		t.Error("completed workflow should be evictable")
+	}
+}
+
+func TestSchedulerCache_GetRemovesFromCache(t *testing.T) {
+	c := newSchedulerCache(2)
+
+	cs1 := testCachedScheduler()
+	c.Put("wf-1", "run-1", cs1)
+
+	got := c.Get("wf-1", "run-1")
+	if got != cs1 {
+		t.Fatal("expected to get cached scheduler")
+	}
+
+	got2 := c.Get("wf-1", "run-1")
+	if got2 != nil {
+		t.Error("entry should be removed from cache after Get")
+	}
+
+	c.Put("wf-2", "run-2", testCachedScheduler())
+	c.Put("wf-3", "run-3", testCachedScheduler())
+	c.Put("wf-4", "run-4", testCachedScheduler())
+
+	if c.Get("wf-2", "run-2") != nil {
+		t.Error("wf-2 should have been evicted")
 	}
 }

@@ -50,14 +50,15 @@ func (r *byteReader) remaining() int {
 type op int
 
 const (
-	opSchedule op = iota // Schedule activity, add future to pending list
-	opGet                // Get specific pending future by index
-	opGetAll             // Get all pending futures in order
-	opGo                 // Spawn fiber with nested block
-	opYield              // Explicit yield point
-	opSleep              // Sleep for a duration
-	opSelect             // Select from multiple pending futures
-	opCount              // sentinel
+	opSchedule      op = iota // Schedule activity, add future to pending list
+	opGet                     // Get specific pending future by index
+	opGetAll                  // Get all pending futures in order
+	opGo                      // Spawn fiber with nested block
+	opYield                   // Explicit yield point
+	opSleep                   // Sleep for a duration
+	opSelect                  // Select from multiple pending futures
+	opChildWorkflow           // Schedule child workflow
+	opCount                   // sentinel
 )
 
 func (o op) String() string {
@@ -77,6 +78,8 @@ func (o op) String() string {
 		return "Sleep"
 	case opSelect:
 		return "Select"
+	case opChildWorkflow:
+		return "ChildWorkflow"
 	default:
 		return fmt.Sprintf("op(%d)", o)
 	}
@@ -89,6 +92,7 @@ type operation struct {
 	indices  []int  // future indices for opSelect
 	children []ast  // nested block for opGo
 	duration int    // sleep duration in ms for opSleep
+	childID  int    // child workflow ID for opChildWorkflow
 }
 
 type ast struct {
@@ -173,6 +177,11 @@ func decodeBlock(r *byteReader, depth int) ast {
 				result.ops = append(result.ops, operation{op: o, indices: indices})
 				pendingCount-- // One future consumed by select
 			}
+
+		case opChildWorkflow:
+			childID := r.intn(100)
+			result.ops = append(result.ops, operation{op: o, childID: childID})
+			pendingCount++
 		}
 	}
 
@@ -211,6 +220,8 @@ func formatAST(a ast, indent int) string {
 			sb.WriteString(fmt.Sprintf("Sleep(%dms)\n", op.duration))
 		case opSelect:
 			sb.WriteString(fmt.Sprintf("Select(%v)\n", op.indices))
+		case opChildWorkflow:
+			sb.WriteString(fmt.Sprintf("ChildWorkflow(%d)\n", op.childID))
 		}
 	}
 
@@ -282,6 +293,12 @@ func executeBlock(ctx Context, a ast) {
 					futures = futures[:last]
 				}
 			}
+
+		case opChildWorkflow:
+			ref := NewChildWorkflowRef[int, string]("fuzz-child")
+			workflowID := fmt.Sprintf("child-%d", op.childID)
+			f := ref.Execute(ctx, workflowID, op.childID)
+			futures = append(futures, f)
 		}
 	}
 }
@@ -301,7 +318,20 @@ type fuzzStore struct {
 	pendingTasks      []journal.PendingWorkflowTask
 	pendingActivities []pendingActivityInfo
 	pendingTimers     []pendingTimerInfo
+	pendingChildren   []pendingChildInfo
+	childToParent     map[string]childLink // childKey -> parent info
 	completionOrder   []int
+}
+
+type pendingChildInfo struct {
+	workflowID string
+	runID      string
+}
+
+type childLink struct {
+	parentWorkflowID string
+	parentRunID      string
+	scheduledAt      int
 }
 
 type pendingActivityInfo struct {
@@ -319,8 +349,9 @@ type pendingTimerInfo struct {
 
 func newFuzzStore() *fuzzStore {
 	return &fuzzStore{
-		events:      make(map[string][]journal.Event),
-		lastEventID: make(map[string]int),
+		events:        make(map[string][]journal.Event),
+		lastEventID:   make(map[string]int),
+		childToParent: make(map[string]childLink),
 	}
 }
 
@@ -345,39 +376,157 @@ func (fs *fuzzStore) LoadFrom(ctx context.Context, workflowID, runID string, aft
 
 func (fs *fuzzStore) Append(ctx context.Context, workflowID, runID string, events []journal.Event, scheduledByEventID int) ([]int, error) {
 	key := fs.key(workflowID, runID)
-	eventID := fs.lastEventID[key]
 	ids := make([]int, len(events))
 
+	// matches real store: assign all IDs before side effects to avoid interleaving
+	eventID := fs.lastEventID[key]
 	for i, ev := range events {
 		eventID++
 		ids[i] = eventID
 		fs.events[key] = append(fs.events[key], ev.WithID(eventID))
+	}
+	fs.lastEventID[key] = eventID
 
+	for i, ev := range events {
 		switch e := ev.(type) {
 		case journal.WorkflowTaskScheduled:
 			fs.pendingTasks = append(fs.pendingTasks, journal.PendingWorkflowTask{
 				WorkflowID:  workflowID,
 				RunID:       runID,
-				ScheduledAt: eventID,
+				ScheduledAt: ids[i],
 			})
 		case journal.ActivityScheduled:
 			fs.pendingActivities = append(fs.pendingActivities, pendingActivityInfo{
 				workflowID:  workflowID,
 				runID:       runID,
-				scheduledID: eventID,
+				scheduledID: ids[i],
 				name:        e.Name,
 			})
 		case journal.TimerScheduled:
 			fs.pendingTimers = append(fs.pendingTimers, pendingTimerInfo{
 				workflowID:  workflowID,
 				runID:       runID,
-				scheduledID: eventID,
+				scheduledID: ids[i],
 			})
+		case journal.ChildWorkflowScheduled:
+			fs.spawnChildWorkflow(workflowID, runID, e, ids[i])
+		case journal.WorkflowCompleted, journal.WorkflowFailed:
+			fs.handleWorkflowCompletion(workflowID, runID, ev)
 		}
 	}
 
-	fs.lastEventID[key] = eventID
 	return ids, nil
+}
+
+func (fs *fuzzStore) spawnChildWorkflow(parentWorkflowID, parentRunID string, scheduled journal.ChildWorkflowScheduled, scheduledAt int) {
+	parentKey := fs.key(parentWorkflowID, parentRunID)
+	childRunID := fmt.Sprintf("run-%d", time.Now().UnixNano())
+	childKey := fs.key(scheduled.WorkflowID, childRunID)
+
+	fs.events[childKey] = []journal.Event{
+		journal.WorkflowStarted{
+			BaseEvent:    journal.BaseEvent{ID: 1},
+			WorkflowType: scheduled.WorkflowType,
+			Args:         scheduled.Input,
+			StartedAt:    time.Now(),
+		},
+		journal.WorkflowTaskScheduled{
+			BaseEvent: journal.BaseEvent{ID: 2},
+		},
+	}
+	fs.lastEventID[childKey] = 2
+
+	fs.pendingTasks = append(fs.pendingTasks, journal.PendingWorkflowTask{
+		WorkflowID:  scheduled.WorkflowID,
+		RunID:       childRunID,
+		ScheduledAt: 2,
+	})
+
+	fs.childToParent[childKey] = childLink{
+		parentWorkflowID: parentWorkflowID,
+		parentRunID:      parentRunID,
+		scheduledAt:      scheduledAt,
+	}
+
+	fs.pendingChildren = append(fs.pendingChildren, pendingChildInfo{
+		workflowID: scheduled.WorkflowID,
+		runID:      childRunID,
+	})
+
+	parentEventID := fs.lastEventID[parentKey] + 1
+	fs.events[parentKey] = append(fs.events[parentKey], journal.ChildWorkflowStarted{
+		BaseEvent:  journal.BaseEvent{ID: parentEventID, ScheduledByID: scheduledAt},
+		ChildRunID: childRunID,
+		StartedAt:  time.Now(),
+	})
+	fs.lastEventID[parentKey] = parentEventID
+}
+
+func (fs *fuzzStore) handleWorkflowCompletion(workflowID, runID string, ev journal.Event) {
+	key := fs.key(workflowID, runID)
+
+	link, ok := fs.childToParent[key]
+	if !ok {
+		return
+	}
+
+	// avoid double-completion when engine completes child
+	for i, child := range fs.pendingChildren {
+		if child.workflowID == workflowID && child.runID == runID {
+			fs.pendingChildren = slices.Delete(fs.pendingChildren, i, i+1)
+			break
+		}
+	}
+
+	fs.notifyParentOfChildCompletion(link, workflowID, runID, ev)
+	delete(fs.childToParent, key)
+}
+
+func (fs *fuzzStore) notifyParentOfChildCompletion(link childLink, childWorkflowID, childRunID string, childCompletionEvent journal.Event) {
+	parentKey := fs.key(link.parentWorkflowID, link.parentRunID)
+
+	var completionEvent journal.Event
+	switch e := childCompletionEvent.(type) {
+	case journal.WorkflowCompleted:
+		completionEvent = journal.ChildWorkflowCompleted{
+			BaseEvent:       journal.BaseEvent{ScheduledByID: link.scheduledAt},
+			ChildWorkflowID: childWorkflowID,
+			ChildRunID:      childRunID,
+			Result:          e.Result,
+		}
+	case journal.WorkflowFailed:
+		completionEvent = journal.ChildWorkflowFailed{
+			BaseEvent:       journal.BaseEvent{ScheduledByID: link.scheduledAt},
+			ChildWorkflowID: childWorkflowID,
+			ChildRunID:      childRunID,
+			Error:           e.Error,
+		}
+	default:
+		return
+	}
+
+	eventID := fs.lastEventID[parentKey] + 1
+	fs.events[parentKey] = append(fs.events[parentKey], completionEvent.WithID(eventID))
+	fs.lastEventID[parentKey] = eventID
+
+	// COALESCING: Only schedule wake-up if no pending task for parent
+	for _, task := range fs.pendingTasks {
+		if task.WorkflowID == link.parentWorkflowID && task.RunID == link.parentRunID {
+			return
+		}
+	}
+
+	taskEventID := eventID + 1
+	fs.events[parentKey] = append(fs.events[parentKey], journal.WorkflowTaskScheduled{
+		BaseEvent: journal.BaseEvent{ID: taskEventID},
+	})
+	fs.lastEventID[parentKey] = taskEventID
+
+	fs.pendingTasks = append(fs.pendingTasks, journal.PendingWorkflowTask{
+		WorkflowID:  link.parentWorkflowID,
+		RunID:       link.parentRunID,
+		ScheduledAt: taskEventID,
+	})
 }
 
 func (fs *fuzzStore) WaitForWorkflowTasks(ctx context.Context, workerID string, maxNew int) ([]journal.PendingWorkflowTask, error) {
@@ -386,35 +535,31 @@ func (fs *fuzzStore) WaitForWorkflowTasks(ctx context.Context, workerID string, 
 		return nil, ctx.Err()
 	}
 
-	tasks := fs.pendingTasks
-	fs.pendingTasks = nil
+	// Only return ONE task at a time to match production behavior
+	// This ensures coalescing works correctly when children complete during processing
+	task := fs.pendingTasks[0]
+	fs.pendingTasks = fs.pendingTasks[1:]
 
 	now := time.Now()
-	result := make([]journal.PendingWorkflowTask, len(tasks))
+	key := fs.key(task.WorkflowID, task.RunID)
 
-	for i, task := range tasks {
-		key := fs.key(task.WorkflowID, task.RunID)
+	startedID := fs.lastEventID[key] + 1
+	fs.events[key] = append(fs.events[key], journal.WorkflowTaskStarted{
+		BaseEvent: journal.BaseEvent{ID: startedID, ScheduledByID: task.ScheduledAt},
+		WorkerID:  workerID,
+		StartedAt: now,
+	})
+	fs.lastEventID[key] = startedID
 
-		startedID := fs.lastEventID[key] + 1
-		fs.events[key] = append(fs.events[key], journal.WorkflowTaskStarted{
-			BaseEvent: journal.BaseEvent{ID: startedID, ScheduledByID: task.ScheduledAt},
-			WorkerID:  workerID,
-			StartedAt: now,
-		})
-		fs.lastEventID[key] = startedID
-
-		result[i] = journal.PendingWorkflowTask{
-			WorkflowID:  task.WorkflowID,
-			RunID:       task.RunID,
-			ScheduledAt: task.ScheduledAt,
-			StartedAt:   now,
-		}
-	}
-
-	return result, nil
+	return []journal.PendingWorkflowTask{{
+		WorkflowID:  task.WorkflowID,
+		RunID:       task.RunID,
+		ScheduledAt: task.ScheduledAt,
+		StartedAt:   now,
+	}}, nil
 }
 
-func (fs *fuzzStore) WaitForActivityTasks(ctx context.Context, workerID string) ([]journal.PendingActivityTask, error) {
+func (fs *fuzzStore) WaitForActivityTasks(ctx context.Context, workerID string, maxActivities int) ([]journal.PendingActivityTask, error) {
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -472,6 +617,14 @@ func (fs *fuzzStore) CreateWorkflow(ctx context.Context, workflowID, workflowTyp
 	})
 
 	return runID, nil
+}
+
+func (fs *fuzzStore) CancelWorkflow(ctx context.Context, workflowID, reason string) error {
+	return nil
+}
+
+func (fs *fuzzStore) ListWorkflows(ctx context.Context, opts ...journal.ListWorkflowsOption) (*journal.ListWorkflowsResult, error) {
+	return &journal.ListWorkflowsResult{}, nil
 }
 
 func (fs *fuzzStore) hasPendingTasks() bool {
@@ -546,11 +699,49 @@ func (fs *fuzzStore) fireTimer(r *byteReader) {
 	}, 0)
 }
 
+func (fs *fuzzStore) hasPendingChildren() bool {
+	return len(fs.pendingChildren) > 0
+}
+
+func (fs *fuzzStore) completeChildWorkflow(r *byteReader) {
+	if len(fs.pendingChildren) == 0 {
+		return
+	}
+
+	idx := r.intn(len(fs.pendingChildren))
+	child := fs.pendingChildren[idx]
+	fs.pendingChildren = slices.Delete(fs.pendingChildren, idx, idx+1)
+
+	key := fs.key(child.workflowID, child.runID)
+
+	var scheduledAt int
+	for _, ev := range fs.events[key] {
+		if ev.EventType() == journal.TypeWorkflowTaskScheduled {
+			scheduledAt = ev.Base().ID
+		}
+	}
+
+	resultJSON := []byte(`"child-result"`)
+	fs.Append(context.Background(), child.workflowID, child.runID, []journal.Event{
+		journal.WorkflowTaskStarted{
+			BaseEvent: journal.BaseEvent{ScheduledByID: scheduledAt},
+			WorkerID:  "fuzz-worker",
+			StartedAt: time.Now(),
+		},
+		journal.WorkflowTaskCompleted{
+			BaseEvent: journal.BaseEvent{ScheduledByID: scheduledAt},
+		},
+		journal.WorkflowCompleted{
+			Result: resultJSON,
+		},
+	}, 0)
+}
+
 func (fs *fuzzStore) isWorkflowComplete(workflowID, runID string) bool {
 	events, _ := fs.Load(context.Background(), workflowID, runID)
 	for _, ev := range events {
 		switch ev.EventType() {
-		case journal.TypeWorkflowCompleted, journal.TypeWorkflowFailed:
+		case journal.TypeWorkflowCompleted, journal.TypeWorkflowFailed, journal.TypeWorkflowCancelled:
 			return true
 		}
 	}
@@ -566,7 +757,10 @@ func fuzzRun(data []byte, wf func(Context), timeout time.Duration) fuzzResult {
 	}
 
 	store := newFuzzStore()
-	engine := NewEngine(store)
+	engine, err := NewEngine(store, WithEngineLogger(testLogger()))
+	if err != nil {
+		panic(err)
+	}
 
 	for _, name := range fuzzActivityNames {
 		name := name
@@ -578,6 +772,10 @@ func fuzzRun(data []byte, wf func(Context), timeout time.Duration) fuzzResult {
 	RegisterWorkflow(engine, "fuzz", func(ctx Context, _ struct{}) (struct{}, error) {
 		wf(ctx)
 		return struct{}{}, nil
+	})
+
+	RegisterWorkflow(engine, "fuzz-child", func(ctx Context, id int) (string, error) {
+		return "child-result", nil
 	})
 
 	var result fuzzResult
@@ -621,19 +819,27 @@ func fuzzRun(data []byte, wf func(Context), timeout time.Duration) fuzzResult {
 
 			hasActivities := store.hasPendingActivities()
 			hasTimers := store.hasPendingTimers()
-			if hasActivities || hasTimers {
-				if hasActivities && hasTimers {
-					if r.bool() {
-						succeed := r.bool()
-						store.completeActivity(r, succeed)
-					} else {
-						store.fireTimer(r)
-					}
-				} else if hasActivities {
-					succeed := r.bool()
-					store.completeActivity(r, succeed)
-				} else {
+			hasChildren := store.hasPendingChildren()
+
+			if hasActivities || hasTimers || hasChildren {
+				var options []int
+				if hasActivities {
+					options = append(options, 0)
+				}
+				if hasTimers {
+					options = append(options, 1)
+				}
+				if hasChildren {
+					options = append(options, 2)
+				}
+
+				switch options[r.intn(len(options))] {
+				case 0:
+					store.completeActivity(r, r.bool())
+				case 1:
 					store.fireTimer(r)
+				case 2:
+					store.completeChildWorkflow(r)
 				}
 			}
 		}
@@ -664,7 +870,10 @@ func fuzzReplay(wf func(Context), events []journal.Event) error {
 		}
 	}
 
-	engine := NewEngine(store)
+	engine, err := NewEngine(store, WithEngineLogger(testLogger()))
+	if err != nil {
+		panic(err)
+	}
 
 	for _, name := range fuzzActivityNames {
 		name := name
@@ -678,6 +887,10 @@ func fuzzReplay(wf func(Context), events []journal.Event) error {
 		return struct{}{}, nil
 	})
 
+	RegisterWorkflow(engine, "fuzz-child", func(ctx Context, id int) (string, error) {
+		return "child-result", nil
+	})
+
 	store.pendingTasks = append(store.pendingTasks, journal.PendingWorkflowTask{
 		WorkflowID:  wfID,
 		RunID:       runID,
@@ -689,7 +902,7 @@ func fuzzReplay(wf func(Context), events []journal.Event) error {
 
 	workflowWorker := engine.WorkflowWorker()
 
-	err := workflowWorker.Process(ctx)
+	err = workflowWorker.Process(ctx)
 	if err != nil {
 		return err
 	}
@@ -796,7 +1009,7 @@ func validateEventStream(events []journal.Event) error {
 			}
 			lc.completedAt = base.ID
 
-		case journal.TypeWorkflowCompleted, journal.TypeWorkflowFailed:
+		case journal.TypeWorkflowCompleted, journal.TypeWorkflowFailed, journal.TypeWorkflowCancelled:
 			if workflowTerminated {
 				return fmt.Errorf("duplicate workflow terminal event (first at %d, second at %d)", workflowTerminalID, base.ID)
 			}
@@ -907,6 +1120,10 @@ func FuzzScheduler(f *testing.F) {
 		{1, 0, 4},                // schedule, schedule, yield
 		{0, 3},                   // schedule, go with activity
 		{4, 0, 0, 0, 0, 0, 0, 0}, // many activities, various completion orders
+		{1, 7, 7},                // 2 child workflows (opChildWorkflow = 7)
+		{3, 7, 7, 7},             // 3 child workflows
+		{2, 0, 7},                // activity + child workflow
+		{3, 7, 7, 6, 0, 1},       // child workflows with select
 	}
 
 	for _, seed := range seeds {
@@ -991,6 +1208,63 @@ func TestFuzz_ParallelActivities(t *testing.T) {
 
 	if len(orders) < 2 {
 		t.Errorf("expected multiple completion orders, got %d", len(orders))
+	}
+}
+
+func TestFuzz_ParallelChildWorkflows(t *testing.T) {
+	a := ast{ops: []operation{
+		{op: opChildWorkflow, childID: 1},
+		{op: opChildWorkflow, childID: 2},
+		{op: opChildWorkflow, childID: 3},
+		{op: opGetAll},
+	}}
+	wf := compile(a)
+
+	for i := 0; i < 20; i++ {
+		data := []byte{byte(i), byte(i * 7), byte(i * 13)}
+		result := fuzzRun(data, wf, 5*time.Second)
+
+		if result.enginePanic != nil {
+			t.Fatalf("iteration %d: engine panic: %v", i, result.enginePanic)
+		}
+		if result.engineErr != nil {
+			t.Fatalf("iteration %d: engine error: %v", i, result.engineErr)
+		}
+		if !result.completed {
+			t.Logf("iteration %d: workflow did not complete (may need more iterations)", i)
+		}
+	}
+}
+
+func TestFuzz_ChildWorkflowCoalescing(t *testing.T) {
+	// This test specifically exercises the coalescing scenario:
+	// Multiple children complete while a parent task is pending
+	a := ast{ops: []operation{
+		{op: opChildWorkflow, childID: 1},
+		{op: opChildWorkflow, childID: 2},
+		{op: opChildWorkflow, childID: 3},
+		{op: opChildWorkflow, childID: 4},
+		{op: opChildWorkflow, childID: 5},
+		{op: opGetAll},
+	}}
+	wf := compile(a)
+
+	for i := 0; i < 50; i++ {
+		data := []byte{byte(i), byte(i*3 + 1), byte(i*7 + 2), byte(i*11 + 3)}
+		result := fuzzRun(data, wf, 10*time.Second)
+
+		if result.enginePanic != nil {
+			t.Fatalf("iteration %d: engine panic: %v\nAST:\n%s", i, result.enginePanic, a)
+		}
+		if result.engineErr != nil {
+			t.Fatalf("iteration %d: engine error: %v\nAST:\n%s", i, result.engineErr, a)
+		}
+
+		if result.completed {
+			if err := fuzzReplay(wf, result.events); err != nil {
+				t.Fatalf("iteration %d: replay failed: %v", i, err)
+			}
+		}
 	}
 }
 

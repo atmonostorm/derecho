@@ -13,10 +13,23 @@ type ExecutionState interface {
 	NewRecorder(afterEventID int) Recorder
 	GetByScheduledID(scheduledEventID int) []journal.Event
 	GetSignals(signalName string) []journal.SignalReceived
+	GetCancelRequest() *journal.WorkflowCancelRequested
+}
+
+// ScheduledIDReceiver is implemented by futures that need their scheduled ID
+// updated after Commit assigns real event IDs.
+type ScheduledIDReceiver interface {
+	SetScheduledID(id int)
 }
 
 type Recorder interface {
-	Record(eventType string, generate func() journal.Event) (journal.Event, error)
+	// Record returns the event and its index in pending. During replay, index
+	// is -1 since the event already has the correct ID. During first execution,
+	// index identifies this event for RegisterPendingFuture.
+	Record(eventType string, generate func() journal.Event) (event journal.Event, pendingIndex int, err error)
+	// RegisterPendingFuture associates a future with a pending event so Commit
+	// can update the future's scheduled ID with the real ID from the store.
+	RegisterPendingFuture(pendingIndex int, f ScheduledIDReceiver)
 	Commit(ctx context.Context, scheduledAtTask int) error
 	PendingCount() int
 }
@@ -35,28 +48,39 @@ type executionState struct {
 	lastEventID        int
 }
 
-func (s *executionState) NewRecorder(afterEventID int) Recorder {
-	if afterEventID > s.lastEventID {
-		s.lastEventID = afterEventID
+func (s *executionState) NewRecorder(workflowTaskScheduledID int) Recorder {
+	// Visibility must match what existed when this task started, otherwise
+	// replay sees completions that arrived after and diverges from original execution.
+	for _, ev := range s.allEvents {
+		if started, ok := ev.(journal.WorkflowTaskStarted); ok {
+			if started.Base().ScheduledByID == workflowTaskScheduledID {
+				s.visibilityBoundary = started.Base().ID
+				if started.Base().ID > s.lastEventID {
+					s.lastEventID = started.Base().ID
+				}
+				break
+			}
+		}
 	}
 	return &recorder{state: s}
 }
 
 type recorder struct {
-	state   *executionState
-	pending []journal.Event
+	state          *executionState
+	pending        []journal.Event
+	pendingFutures []ScheduledIDReceiver
 }
 
 // Record checks event type at this position during replay, returning NondeterminismError
 // on mismatch. We compare type and position only, not payload - inputs may legitimately
 // change between versions as long as the event sequence structure is preserved.
-func (r *recorder) Record(eventType string, generate func() journal.Event) (journal.Event, error) {
+func (r *recorder) Record(eventType string, generate func() journal.Event) (journal.Event, int, error) {
 	s := r.state
 
 	if s.replayIdx < len(s.schedulerEvents) {
 		recorded := s.schedulerEvents[s.replayIdx]
 		if recorded.EventType() != eventType {
-			return nil, &NondeterminismError{
+			return nil, -1, &NondeterminismError{
 				WorkflowID: s.workflowID,
 				RunID:      s.runID,
 				EventSeq:   recorded.Base().ID,
@@ -65,16 +89,16 @@ func (r *recorder) Record(eventType string, generate func() journal.Event) (jour
 			}
 		}
 		s.replayIdx++
-		s.visibilityBoundary = recorded.Base().ID
-		return recorded, nil
+		return recorded, -1, nil
 	}
 
 	event := generate()
 	provisionalID := s.lastEventID + len(r.pending) + 1
 	event = event.WithID(provisionalID)
+	pendingIndex := len(r.pending)
 	r.pending = append(r.pending, event)
 	s.newEvents = append(s.newEvents, event)
-	return event, nil
+	return event, pendingIndex, nil
 }
 
 func (r *recorder) Commit(ctx context.Context, scheduledAtTask int) error {
@@ -89,6 +113,7 @@ func (r *recorder) Commit(ctx context.Context, scheduledAtTask int) error {
 		s.lastEventID = r.pending[len(r.pending)-1].Base().ID
 		s.visibilityBoundary = s.lastEventID
 		r.pending = nil
+		r.pendingFutures = nil
 		return nil
 	}
 
@@ -97,14 +122,35 @@ func (r *recorder) Commit(ctx context.Context, scheduledAtTask int) error {
 		return err
 	}
 
+	// provisional IDs can differ from real IDs when side-effect events
+	// (like ChildWorkflowStarted) are inserted between our events during Append
+	startIdx := len(s.newEvents) - len(r.pending)
+	for i, id := range ids {
+		s.newEvents[startIdx+i] = s.newEvents[startIdx+i].WithID(id)
+		if i < len(r.pendingFutures) && r.pendingFutures[i] != nil {
+			r.pendingFutures[i].SetScheduledID(id)
+		}
+	}
+
 	s.lastEventID = ids[len(ids)-1]
 	s.visibilityBoundary = s.lastEventID
 	r.pending = nil
+	r.pendingFutures = nil
 	return nil
 }
 
 func (r *recorder) PendingCount() int {
 	return len(r.pending)
+}
+
+func (r *recorder) RegisterPendingFuture(pendingIndex int, f ScheduledIDReceiver) {
+	if pendingIndex < 0 {
+		return
+	}
+	for len(r.pendingFutures) <= pendingIndex {
+		r.pendingFutures = append(r.pendingFutures, nil)
+	}
+	r.pendingFutures[pendingIndex] = f
 }
 
 func isSchedulerEvent(ev journal.Event) bool {
@@ -115,6 +161,7 @@ func isSchedulerEvent(ev journal.Event) bool {
 		journal.TypeChildWorkflowScheduled,
 		journal.TypeWorkflowCompleted,
 		journal.TypeWorkflowFailed,
+		journal.TypeWorkflowCancelled,
 		journal.TypeWorkflowContinuedAsNew,
 		journal.TypeSideEffectRecorded,
 		journal.TypeSignalExternalScheduled:
@@ -179,6 +226,18 @@ func (s *executionState) GetSignals(signalName string) []journal.SignalReceived 
 	return result
 }
 
+func (s *executionState) GetCancelRequest() *journal.WorkflowCancelRequested {
+	for _, ev := range s.allEvents {
+		if ev.Base().ID > s.visibilityBoundary {
+			continue
+		}
+		if cancel, ok := ev.(journal.WorkflowCancelRequested); ok {
+			return &cancel
+		}
+	}
+	return nil
+}
+
 func (s *executionState) AddEvents(events []journal.Event) {
 	s.allEvents = append(s.allEvents, events...)
 	for _, ev := range events {
@@ -205,12 +264,14 @@ func (s *executionState) NewEvents() []journal.Event {
 	return s.newEvents
 }
 
+// HasPendingWork returns true if workflow has in-flight activities or timers.
+// ChildWorkflowScheduled intentionally excluded: parents waiting for children
+// aren't doing CPU work and can be evicted safely. They'll replay when children complete.
 func (s *executionState) HasPendingWork() bool {
 	for _, ev := range s.allEvents {
 		switch ev.EventType() {
 		case journal.TypeActivityScheduled,
-			journal.TypeTimerScheduled,
-			journal.TypeChildWorkflowScheduled:
+			journal.TypeTimerScheduled:
 			if !s.hasCompletion(ev.Base().ID) {
 				return true
 			}

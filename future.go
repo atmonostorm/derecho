@@ -22,6 +22,10 @@ type activityFuture[T any] struct {
 	done        bool
 }
 
+func (f *activityFuture[T]) SetScheduledID(id int) {
+	f.scheduledID = id
+}
+
 func newActivityFuture[T any](scheduledID int, codec Codec) Future[T] {
 	return &activityFuture[T]{scheduledID: scheduledID, codec: codec}
 }
@@ -69,8 +73,12 @@ type timerFuture struct {
 	done        bool
 }
 
-func newTimerFuture(scheduledID int) Future[time.Time] {
+func newTimerFuture(scheduledID int) *timerFuture {
 	return &timerFuture{scheduledID: scheduledID}
+}
+
+func (f *timerFuture) SetScheduledID(id int) {
+	f.scheduledID = id
 }
 
 func (f *timerFuture) Get(ctx Context) (time.Time, error) {

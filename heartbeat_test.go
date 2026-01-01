@@ -11,7 +11,7 @@ import (
 func TestHeartbeat_ActivityCompletes(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	derecho.RegisterActivity(engine, "heartbeating", func(ctx context.Context, _ struct{}) (string, error) {
 		derecho.Heartbeat(ctx, "progress-1")
@@ -60,7 +60,7 @@ func TestHeartbeat_ActivityCompletes(t *testing.T) {
 func TestHeartbeat_TimeoutWithoutHeartbeat(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	activityStarted := make(chan struct{})
 	activityBlock := make(chan struct{})
@@ -129,7 +129,7 @@ func TestHeartbeat_TimeoutWithoutHeartbeat(t *testing.T) {
 func TestHeartbeat_ResetsDeadline(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	activityStarted := make(chan struct{})
 	heartbeatDone := make(chan struct{})
@@ -210,7 +210,7 @@ func TestHeartbeat_ResetsDeadline(t *testing.T) {
 
 func TestHeartbeat_NoOpWithoutConfiguration(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	var heartbeatCalled bool
 
@@ -265,7 +265,7 @@ func TestHeartbeat_NoOpWithoutConfiguration(t *testing.T) {
 func TestHeartbeat_StaleHeartbeatIgnored(t *testing.T) {
 	clock := derecho.NewFakeClock(time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC))
 	store := derecho.NewMemoryStore(derecho.WithStoreClock(clock))
-	engine := derecho.NewEngine(store, derecho.WithClock(clock))
+	engine := mustEngine(t, store, derecho.WithClock(clock))
 
 	derecho.RegisterActivity(engine, "fast", func(ctx context.Context, _ struct{}) (string, error) {
 		return "done", nil

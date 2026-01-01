@@ -14,6 +14,8 @@ const panicOutsideWorkflow = "derecho: called outside workflow context"
 // interfaces (yielder, spawner, etc) are safe - only workflowContext exists.
 type Context interface {
 	derechoContext()
+
+	Err() error
 }
 
 type workflowContext struct {
@@ -23,6 +25,17 @@ type workflowContext struct {
 
 func (*workflowContext) derechoContext() {}
 
+func (ctx *workflowContext) Err() error {
+	if ctx.s.cancelRequested {
+		return ErrCancelled
+	}
+	return nil
+}
+
+func (ctx *workflowContext) cancelFuture() Future[CancelInfo] {
+	return ctx.s.cancelFut
+}
+
 // failInternal terminates the workflow fiber with an infrastructure error.
 // Uses runtime.Goexit so user code cannot intercept via recover().
 func (ctx *workflowContext) failInternal(err error) {
@@ -31,7 +44,7 @@ func (ctx *workflowContext) failInternal(err error) {
 }
 
 func (ctx *workflowContext) emitWorkflowCompleted(result []byte) {
-	_, err := ctx.s.recorder.Record(journal.TypeWorkflowCompleted, func() journal.Event {
+	_, _, err := ctx.s.recorder.Record(journal.TypeWorkflowCompleted, func() journal.Event {
 		return journal.WorkflowCompleted{Result: result}
 	})
 	if err != nil {
@@ -40,7 +53,7 @@ func (ctx *workflowContext) emitWorkflowCompleted(result []byte) {
 }
 
 func (ctx *workflowContext) emitWorkflowFailed(err error) {
-	_, recordErr := ctx.s.recorder.Record(journal.TypeWorkflowFailed, func() journal.Event {
+	_, _, recordErr := ctx.s.recorder.Record(journal.TypeWorkflowFailed, func() journal.Event {
 		return journal.WorkflowFailed{Error: journal.ToError(err)}
 	})
 	if recordErr != nil {
@@ -48,8 +61,17 @@ func (ctx *workflowContext) emitWorkflowFailed(err error) {
 	}
 }
 
+func (ctx *workflowContext) emitWorkflowCancelled() {
+	_, _, recordErr := ctx.s.recorder.Record(journal.TypeWorkflowCancelled, func() journal.Event {
+		return journal.WorkflowCancelled{Forced: false}
+	})
+	if recordErr != nil {
+		ctx.failInternal(recordErr)
+	}
+}
+
 func (ctx *workflowContext) emitContinueAsNew(input []byte) {
-	_, recordErr := ctx.s.recorder.Record(journal.TypeWorkflowContinuedAsNew, func() journal.Event {
+	_, _, recordErr := ctx.s.recorder.Record(journal.TypeWorkflowContinuedAsNew, func() journal.Event {
 		return journal.WorkflowContinuedAsNew{NewInput: input}
 	})
 	if recordErr != nil {
@@ -57,9 +79,9 @@ func (ctx *workflowContext) emitContinueAsNew(input []byte) {
 	}
 }
 
-func (ctx *workflowContext) emitActivityScheduled(name string, input []byte, retryPolicy *journal.RetryPolicyPayload, timeoutPolicy *journal.TimeoutPolicyPayload) int {
+func (ctx *workflowContext) emitActivityScheduled(name string, input []byte, retryPolicy *journal.RetryPolicyPayload, timeoutPolicy *journal.TimeoutPolicyPayload) (id int, newEventIndex int) {
 	scheduledAt := ctx.s.workflowTime
-	recorded, err := ctx.s.recorder.Record(journal.TypeActivityScheduled, func() journal.Event {
+	recorded, idx, err := ctx.s.recorder.Record(journal.TypeActivityScheduled, func() journal.Event {
 		return journal.ActivityScheduled{
 			Name:          name,
 			Input:         input,
@@ -71,15 +93,15 @@ func (ctx *workflowContext) emitActivityScheduled(name string, input []byte, ret
 	if err != nil {
 		ctx.failInternal(err)
 	}
-	return recorded.Base().ID
+	return recorded.Base().ID, idx
 }
 
 func (ctx *workflowContext) defaultRetryPolicy() *RetryPolicy {
 	return ctx.s.defaultRetryPolicy
 }
 
-func (ctx *workflowContext) emitTimerScheduled(duration time.Duration, fireAt time.Time) int {
-	recorded, err := ctx.s.recorder.Record(journal.TypeTimerScheduled, func() journal.Event {
+func (ctx *workflowContext) emitTimerScheduled(duration time.Duration, fireAt time.Time) (id int, newEventIndex int) {
+	recorded, idx, err := ctx.s.recorder.Record(journal.TypeTimerScheduled, func() journal.Event {
 		return journal.TimerScheduled{
 			Duration: duration,
 			FireAt:   fireAt,
@@ -88,11 +110,11 @@ func (ctx *workflowContext) emitTimerScheduled(duration time.Duration, fireAt ti
 	if err != nil {
 		ctx.failInternal(err)
 	}
-	return recorded.Base().ID
+	return recorded.Base().ID, idx
 }
 
 func (ctx *workflowContext) emitTimerCancelled(scheduledID int) {
-	_, err := ctx.s.recorder.Record(journal.TypeTimerCancelled, func() journal.Event {
+	_, _, err := ctx.s.recorder.Record(journal.TypeTimerCancelled, func() journal.Event {
 		return journal.TimerCancelled{
 			BaseEvent: journal.BaseEvent{ScheduledByID: scheduledID},
 		}
@@ -102,9 +124,9 @@ func (ctx *workflowContext) emitTimerCancelled(scheduledID int) {
 	}
 }
 
-func (ctx *workflowContext) emitChildWorkflowScheduled(workflowType, workflowID string, input []byte, closePolicy journal.ParentClosePolicy) int {
+func (ctx *workflowContext) emitChildWorkflowScheduled(workflowType, workflowID string, input []byte, closePolicy journal.ParentClosePolicy) (id int, newEventIndex int) {
 	info := ctx.s.workflowInfo
-	recorded, err := ctx.s.recorder.Record(journal.TypeChildWorkflowScheduled, func() journal.Event {
+	recorded, idx, err := ctx.s.recorder.Record(journal.TypeChildWorkflowScheduled, func() journal.Event {
 		return journal.ChildWorkflowScheduled{
 			WorkflowType:      workflowType,
 			WorkflowID:        workflowID,
@@ -117,7 +139,7 @@ func (ctx *workflowContext) emitChildWorkflowScheduled(workflowType, workflowID 
 	if err != nil {
 		ctx.failInternal(err)
 	}
-	return recorded.Base().ID
+	return recorded.Base().ID, idx
 }
 
 func (ctx *workflowContext) getByScheduledID(scheduledEventID int) []journal.Event {
@@ -165,7 +187,7 @@ func (ctx *workflowContext) emitSignalExternalScheduled(targetWorkflowID, signal
 		ctx.failInternal(err)
 	}
 
-	_, err = ctx.s.recorder.Record(journal.TypeSignalExternalScheduled, func() journal.Event {
+	_, _, err = ctx.s.recorder.Record(journal.TypeSignalExternalScheduled, func() journal.Event {
 		return journal.SignalExternalScheduled{
 			TargetWorkflowID: targetWorkflowID,
 			SignalName:       signalName,
@@ -189,7 +211,7 @@ type spawner interface {
 }
 
 type timerScheduler interface {
-	emitTimerScheduled(duration time.Duration, fireAt time.Time) int
+	emitTimerScheduled(duration time.Duration, fireAt time.Time) (id int, newEventIndex int)
 	workflowTime() time.Time
 }
 
@@ -223,4 +245,12 @@ func (ctx *workflowContext) signalProgress() {
 
 type internalFailer interface {
 	failInternal(err error)
+}
+
+type futureRegistrar interface {
+	registerPendingFuture(pendingIndex int, f ScheduledIDReceiver)
+}
+
+func (ctx *workflowContext) registerPendingFuture(pendingIndex int, f ScheduledIDReceiver) {
+	ctx.s.recorder.RegisterPendingFuture(pendingIndex, f)
 }

@@ -9,7 +9,7 @@ import (
 
 func TestContinueAsNew_Basic(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	iterations := 0
 	derecho.RegisterWorkflow(engine, "continue-test", func(ctx derecho.Context, count int) (int, error) {
@@ -54,7 +54,7 @@ func TestContinueAsNew_Basic(t *testing.T) {
 
 func TestContinueAsNew_IDSemantics(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	var seenWorkflowIDs, seenRunIDs []string
 	derecho.RegisterWorkflow(engine, "id-test", func(ctx derecho.Context, count int) (int, error) {
@@ -101,7 +101,7 @@ func TestContinueAsNew_IDSemantics(t *testing.T) {
 
 func TestContinueAsNew_WithStructInput(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	type State struct {
 		Count int    `json:"count"`
@@ -142,7 +142,7 @@ func TestContinueAsNew_WithStructInput(t *testing.T) {
 
 func TestContinueAsNew_Replay(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	continueWorkflow := func(ctx derecho.Context, count int) (int, error) {
 		if count < 2 {
@@ -173,4 +173,52 @@ func TestContinueAsNew_Replay(t *testing.T) {
 	if err := derecho.Replay(continueWorkflow, events); err != nil {
 		t.Fatalf("Replay() = %v, want nil", err)
 	}
+}
+
+func TestContinueAsNew_ChildWorkflow(t *testing.T) {
+	store := derecho.NewMemoryStore()
+	engine := mustEngine(t, store)
+
+	childRef := derecho.NewChildWorkflowRef[int, int]("continuing-child")
+
+	derecho.RegisterWorkflow(engine, "continuing-child", func(ctx derecho.Context, count int) (int, error) {
+		if count < 3 {
+			return 0, derecho.NewContinueAsNewError(count + 1)
+		}
+		return count, nil
+	})
+
+	derecho.RegisterWorkflow(engine, "parent-of-continuing", func(ctx derecho.Context, _ struct{}) (int, error) {
+		future := childRef.Execute(ctx, "child-1", 1)
+		return future.Get(ctx)
+	})
+
+	client := engine.Client()
+	worker := engine.WorkflowWorker()
+
+	run, err := client.StartWorkflow(t.Context(), "parent-of-continuing", "parent-1", struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 20; i++ {
+		if err := worker.Process(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		var result int
+		err = run.Get(t.Context(), &result, derecho.NonBlocking())
+		if err == derecho.ErrNotCompleted {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("workflow failed: %v", err)
+		}
+		if result != 3 {
+			t.Errorf("expected 3, got %d", result)
+		}
+		return
+	}
+
+	t.Fatal("parent workflow did not complete after 20 iterations")
 }

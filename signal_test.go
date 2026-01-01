@@ -9,7 +9,7 @@ import (
 
 func TestSignalChannel_ReceiveSingle(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	derecho.RegisterWorkflow(engine, "signal-test", func(ctx derecho.Context, _ struct{}) (string, error) {
 		ch := derecho.GetSignalChannel[string](ctx, "greeting")
@@ -52,7 +52,7 @@ func TestSignalChannel_ReceiveSingle(t *testing.T) {
 
 func TestSignalChannel_ReceiveMultiple(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	derecho.RegisterWorkflow(engine, "multi-signal", func(ctx derecho.Context, _ struct{}) ([]int, error) {
 		ch := derecho.GetSignalChannel[int](ctx, "numbers")
@@ -100,7 +100,7 @@ func TestSignalChannel_ReceiveMultiple(t *testing.T) {
 
 func TestSignalChannel_TryReceive(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	derecho.RegisterWorkflow(engine, "try-recv", func(ctx derecho.Context, _ struct{}) (string, error) {
 		ch := derecho.GetSignalChannel[string](ctx, "maybe")
@@ -140,7 +140,7 @@ func TestSignalChannel_TryReceive(t *testing.T) {
 
 func TestSignalChannel_Selector(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	derecho.RegisterWorkflow(engine, "selector-signal", func(ctx derecho.Context, _ struct{}) (string, error) {
 		ch := derecho.GetSignalChannel[string](ctx, "select-me")
@@ -187,7 +187,7 @@ func TestSignalChannel_Selector(t *testing.T) {
 
 func TestSignalChannel_Replay(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	signalWorkflow := func(ctx derecho.Context, _ struct{}) ([]string, error) {
 		ch := derecho.GetSignalChannel[string](ctx, "replay-test")
@@ -256,7 +256,7 @@ func TestSignalChannel_Replay(t *testing.T) {
 
 func TestSignalExternalWorkflow(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	receiverWorkflow := func(ctx derecho.Context, _ struct{}) (string, error) {
 		ch := derecho.GetSignalChannel[string](ctx, "cross-workflow")
@@ -309,7 +309,7 @@ func TestSignalExternalWorkflow(t *testing.T) {
 
 func TestClient_SignalWorkflow(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	derecho.RegisterWorkflow(engine, "client-signal-test", func(ctx derecho.Context, _ struct{}) (int, error) {
 		ch := derecho.GetSignalChannel[int](ctx, "client-signal")
@@ -358,7 +358,7 @@ func TestSignal_WorkflowNotFound(t *testing.T) {
 
 func TestSignal_CoalescesWakeup(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	derecho.RegisterWorkflow(engine, "coalesce-test", func(ctx derecho.Context, _ struct{}) (int, error) {
 		ch := derecho.GetSignalChannel[int](ctx, "coalesce")

@@ -10,7 +10,7 @@ import (
 
 func TestChildWorkflow_Simple(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	childRef := derecho.NewChildWorkflowRef[string, string]("child")
 
@@ -53,7 +53,7 @@ func TestChildWorkflow_Simple(t *testing.T) {
 
 func TestChildWorkflow_Failure(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	childRef := derecho.NewChildWorkflowRef[string, string]("failing-child")
 
@@ -93,7 +93,7 @@ func TestChildWorkflow_Failure(t *testing.T) {
 
 func TestChildWorkflow_ParallelChildren(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	childRef := derecho.NewChildWorkflowRef[int, int]("doubler")
 
@@ -156,7 +156,7 @@ func TestChildWorkflow_ParallelChildren(t *testing.T) {
 
 func TestChildWorkflow_EventSequence(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	childRef := derecho.NewChildWorkflowRef[string, string]("event-child")
 
@@ -228,7 +228,7 @@ func TestChildWorkflow_EventSequence(t *testing.T) {
 
 func TestChildWorkflow_ParentReplay(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	childRef := derecho.NewChildWorkflowRef[string, string]("replay-child")
 
@@ -298,7 +298,7 @@ func TestChildWorkflow_ParentReplay(t *testing.T) {
 
 func TestChildWorkflow_ParentClosePolicyTerminate(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	childRef := derecho.NewChildWorkflowRef[string, string]("slow-child")
 

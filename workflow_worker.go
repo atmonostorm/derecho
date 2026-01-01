@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
+	"time"
 
 	"github.com/atmonostorm/derecho/journal"
 )
@@ -12,6 +14,7 @@ import (
 type workflowEventEmitter interface {
 	emitWorkflowCompleted(result []byte)
 	emitWorkflowFailed(err error)
+	emitWorkflowCancelled()
 	emitContinueAsNew(input []byte)
 }
 
@@ -24,10 +27,18 @@ type workflowWorker struct {
 	workerID           string
 	codec              Codec
 	defaultRetryPolicy *RetryPolicy
+	logger             *slog.Logger
 }
 
 func (w *workflowWorker) Process(ctx context.Context) error {
 	available := w.cache.AvailableSlots()
+	if available == 0 {
+		if err := w.waitForCacheSlot(ctx); err != nil {
+			return err
+		}
+		available = w.cache.AvailableSlots()
+	}
+
 	pending, err := w.store.WaitForWorkflowTasks(ctx, w.workerID, available)
 	if err != nil {
 		return err
@@ -35,10 +46,32 @@ func (w *workflowWorker) Process(ctx context.Context) error {
 
 	for _, task := range pending {
 		if err := w.processWorkflow(ctx, task); err != nil {
-			return err
+			w.logger.Error("derecho: workflow processing failed",
+				"workflow_id", task.WorkflowID,
+				"run_id", task.RunID,
+				"error", err)
+			w.cache.Remove(task.WorkflowID, task.RunID)
 		}
 	}
 	return nil
+}
+
+// waitForCacheSlot polls until cache has capacity or context cancelled.
+// Prevents hot loop when cache is full of workflows with pending work.
+func (w *workflowWorker) waitForCacheSlot(ctx context.Context) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if w.cache.AvailableSlots() > 0 {
+				return nil
+			}
+		}
+	}
 }
 
 func (w *workflowWorker) processWorkflow(ctx context.Context, task journal.PendingWorkflowTask) error {
@@ -53,12 +86,20 @@ func (w *workflowWorker) processWorkflow(ctx context.Context, task journal.Pendi
 
 		newEvents, err := w.store.LoadFrom(ctx, task.WorkflowID, task.RunID, state.LastEventID())
 		if err != nil {
+			w.logger.Error("derecho: failed to load events from cache",
+				"workflow_id", task.WorkflowID,
+				"run_id", task.RunID,
+				"error", err)
 			return err
 		}
 		state.AddEvents(newEvents)
 	} else {
 		events, err := w.store.Load(ctx, task.WorkflowID, task.RunID)
 		if err != nil {
+			w.logger.Error("derecho: failed to load workflow events",
+				"workflow_id", task.WorkflowID,
+				"run_id", task.RunID,
+				"error", err)
 			return err
 		}
 
@@ -73,11 +114,17 @@ func (w *workflowWorker) processWorkflow(ctx context.Context, task journal.Pendi
 		}
 
 		if startedEvent.WorkflowType == "" {
+			w.logger.Error("derecho: no WorkflowStarted event found",
+				"workflow_id", task.WorkflowID,
+				"run_id", task.RunID)
 			return fmt.Errorf("derecho: no WorkflowStarted event found for %s/%s", task.WorkflowID, task.RunID)
 		}
 
 		fn, ok := w.resolver.ResolveWorkflow(startedEvent.WorkflowType)
 		if !ok {
+			w.logger.Error("derecho: unknown workflow type",
+				"workflow_id", task.WorkflowID,
+				"workflow_type", startedEvent.WorkflowType)
 			return fmt.Errorf("derecho: unknown workflow type: %s", startedEvent.WorkflowType)
 		}
 
@@ -99,6 +146,10 @@ func (w *workflowWorker) processWorkflow(ctx context.Context, task journal.Pendi
 	}
 
 	if err := sched.Advance(ctx, task.ScheduledAt, task.StartedAt); err != nil {
+		w.logger.Error("derecho: workflow advance failed",
+			"workflow_id", task.WorkflowID,
+			"run_id", task.RunID,
+			"error", err)
 		w.cache.Remove(task.WorkflowID, task.RunID)
 		sched.Close()
 		return err
@@ -129,7 +180,7 @@ func (w *workflowWorker) processWorkflow(ctx context.Context, task journal.Pendi
 func (w *workflowWorker) isWorkflowCompleted(events []journal.Event) bool {
 	for _, ev := range events {
 		switch ev.(type) {
-		case journal.WorkflowCompleted, journal.WorkflowFailed:
+		case journal.WorkflowCompleted, journal.WorkflowFailed, journal.WorkflowCancelled:
 			return true
 		}
 	}
@@ -175,6 +226,10 @@ func BindWorkflowInput(fn any, encodedInput []byte) func(Context) {
 					return
 				}
 				wctx.emitContinueAsNew(inputJSON)
+				return
+			}
+			if errors.Is(err, ErrCancelled) {
+				wctx.emitWorkflowCancelled()
 				return
 			}
 			wctx.emitWorkflowFailed(err)

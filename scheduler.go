@@ -34,6 +34,11 @@ type Scheduler struct {
 	defaultRetryPolicy *RetryPolicy
 
 	signalConsumed map[string]int
+
+	cancelFut       *cancelFutureImpl
+	cancelRequested bool
+	cancelTimeout   time.Duration
+	cancelDeadline  time.Time
 }
 
 type SchedulerOption func(*Scheduler)
@@ -56,6 +61,7 @@ func NewScheduler(state ExecutionState, workflowFn func(Context), info WorkflowI
 		codec:          DefaultCodec,
 		workflowInfo:   info,
 		signalConsumed: make(map[string]int),
+		cancelFut:      &cancelFutureImpl{},
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -86,9 +92,9 @@ func (s *Scheduler) Close() {
 
 func (s *Scheduler) handlePanic(ctx context.Context, panicVal any, scheduledAtTask int) error {
 	// Create fresh recorder - discard any previous events from this round
-	r := s.state.NewRecorder(scheduledAtTask + 1)
+	r := s.state.NewRecorder(scheduledAtTask)
 
-	_, err := r.Record(journal.TypeWorkflowFailed, func() journal.Event {
+	_, _, err := r.Record(journal.TypeWorkflowFailed, func() journal.Event {
 		return journal.WorkflowFailed{
 			Error: journal.NewErrorf(journal.ErrorKindPanic, "panic: %v", panicVal),
 		}
@@ -107,7 +113,7 @@ func (s *Scheduler) handlePanic(ctx context.Context, panicVal any, scheduledAtTa
 
 func (s *Scheduler) handleInternalError(ctx context.Context, internalErr error, scheduledAtTask int) error {
 	// Create fresh recorder - discard any previous events from this round
-	r := s.state.NewRecorder(scheduledAtTask + 1)
+	r := s.state.NewRecorder(scheduledAtTask)
 
 	// Determine error kind based on error type
 	errKind := journal.ErrorKindApplication
@@ -115,7 +121,7 @@ func (s *Scheduler) handleInternalError(ctx context.Context, internalErr error, 
 		errKind = journal.ErrorKindNondeterminism
 	}
 
-	_, err := r.Record(journal.TypeWorkflowFailed, func() journal.Event {
+	_, _, err := r.Record(journal.TypeWorkflowFailed, func() journal.Event {
 		return journal.WorkflowFailed{
 			Error: &journal.Error{
 				Kind:    errKind,
@@ -137,10 +143,15 @@ func (s *Scheduler) handleInternalError(ctx context.Context, internalErr error, 
 
 // Advance runs the scheduler until quiescence or completion.
 // scheduledAtTask is the ID of the WorkflowTaskScheduled event that triggered this advance.
-// Invariant: WorkflowTaskStarted is always scheduledAtTask+1 (appended immediately before Advance).
 func (s *Scheduler) Advance(ctx context.Context, scheduledAtTask int, workflowTime time.Time) error {
 	s.workflowTime = workflowTime
-	s.recorder = s.state.NewRecorder(scheduledAtTask + 1)
+	s.recorder = s.state.NewRecorder(scheduledAtTask)
+
+	s.checkCancellation()
+
+	if !s.cancelDeadline.IsZero() && workflowTime.After(s.cancelDeadline) {
+		return s.forceTerminate(ctx, scheduledAtTask)
+	}
 
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
@@ -187,4 +198,55 @@ func (s *Scheduler) Advance(ctx context.Context, scheduledAtTask int, workflowTi
 	}
 
 	return s.recorder.Commit(ctx, scheduledAtTask)
+}
+
+func (s *Scheduler) checkCancellation() {
+	if s.cancelRequested {
+		return // already processed
+	}
+
+	cancelReq := s.state.GetCancelRequest()
+	if cancelReq == nil {
+		return
+	}
+
+	s.cancelRequested = true
+	s.cancelFut.resolve(CancelInfo{
+		Reason:      cancelReq.Reason,
+		RequestedAt: cancelReq.RequestedAt,
+	})
+
+	if cancelReq.CancelTimeout > 0 {
+		s.cancelTimeout = cancelReq.CancelTimeout
+		s.cancelDeadline = cancelReq.RequestedAt.Add(cancelReq.CancelTimeout)
+	}
+}
+
+func (s *Scheduler) forceTerminate(ctx context.Context, scheduledAtTask int) error {
+	remaining := 0
+	for _, f := range s.fibers {
+		if f != nil {
+			remaining++
+		}
+	}
+
+	r := s.state.NewRecorder(scheduledAtTask)
+	_, _, err := r.Record(journal.TypeWorkflowCancelled, func() journal.Event {
+		return journal.WorkflowCancelled{
+			Forced:          true,
+			RemainingFibers: remaining,
+			Error: journal.NewErrorf(journal.ErrorKindCancelTimeout,
+				"cancel timeout: %d fibers still running after %s", remaining, s.cancelTimeout),
+		}
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := r.Commit(ctx, scheduledAtTask); err != nil {
+		return err
+	}
+
+	s.Close()
+	return nil
 }

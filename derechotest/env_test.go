@@ -220,3 +220,60 @@ func TestChildWorkflowCalls(t *testing.T) {
 		t.Errorf("expected workflow ID 'child-1', got %q", calls[0].WorkflowID)
 	}
 }
+
+var batchedChildRef = derecho.NewChildWorkflowRef[int, struct{}]("batched-child")
+
+func batchedChildWorkflow(ctx derecho.Context, itemCount int) (int, error) {
+	const maxConcurrent = 3
+	var futures []derecho.Future[struct{}]
+	var completedCount int
+
+	for i := 0; i < itemCount; i++ {
+		future := batchedChildRef.Execute(ctx, "child-"+string(rune('A'+i)), i)
+		futures = append(futures, future)
+
+		if len(futures) >= maxConcurrent || i == itemCount-1 {
+			waitCount := len(futures) / 2
+			if waitCount == 0 && len(futures) > 0 {
+				waitCount = 1
+			}
+
+			for j := 0; j < waitCount && j < len(futures); j++ {
+				_, _ = futures[j].Get(ctx)
+				completedCount++
+			}
+
+			if waitCount < len(futures) {
+				futures = futures[waitCount:]
+			} else {
+				futures = nil
+			}
+		}
+	}
+
+	for _, f := range futures {
+		_, _ = f.Get(ctx)
+		completedCount++
+	}
+
+	return completedCount, nil
+}
+
+func TestRun_BatchedChildWorkflows(t *testing.T) {
+	env := New(t)
+	env.StubChildWorkflow("batched-child", struct{}{})
+
+	itemCount := 13
+	completedCount, err := Run(env, batchedChildWorkflow, itemCount)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should have launched all 13 children
+	env.AssertChildWorkflowCalledTimes("batched-child", itemCount)
+
+	// Should have completed all 13
+	if completedCount != itemCount {
+		t.Errorf("expected %d completed, got %d", itemCount, completedCount)
+	}
+}

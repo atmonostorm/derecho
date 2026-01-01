@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 
 	"github.com/atmonostorm/derecho/journal"
@@ -24,6 +25,8 @@ type Engine struct {
 	codec              Codec
 	clock              Clock
 	defaultRetryPolicy *RetryPolicy
+	workerConcurrency  int
+	logger             *slog.Logger
 }
 
 type engineConfig struct {
@@ -34,6 +37,8 @@ type engineConfig struct {
 	workflowResolver   WorkflowResolver
 	activityResolver   ActivityResolver
 	defaultRetryPolicy *RetryPolicy
+	workerConcurrency  int
+	logger             *slog.Logger
 }
 
 type EngineOption func(*engineConfig)
@@ -85,15 +90,34 @@ func WithDefaultRetryPolicy(p RetryPolicy) EngineOption {
 	}
 }
 
-func NewEngine(store journal.Store, opts ...EngineOption) *Engine {
+// WithWorkerConcurrency sets the number of goroutines per worker type.
+func WithWorkerConcurrency(n int) EngineOption {
+	return func(c *engineConfig) {
+		c.workerConcurrency = n
+	}
+}
+
+// WithEngineLogger sets the logger for the engine and its workers.
+func WithEngineLogger(l *slog.Logger) EngineOption {
+	return func(c *engineConfig) {
+		c.logger = l
+	}
+}
+
+func NewEngine(store journal.Store, opts ...EngineOption) (*Engine, error) {
 	cfg := engineConfig{
-		workerID:  randomID(),
-		cacheSize: defaultCacheSize,
-		codec:     DefaultCodec,
-		clock:     RealClock{},
+		workerID:          randomID(),
+		cacheSize:         defaultCacheSize,
+		codec:             DefaultCodec,
+		clock:             RealClock{},
+		workerConcurrency: 5,
 	}
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+
+	if cfg.logger == nil {
+		return nil, errors.New("derecho: logger is required, use WithEngineLogger")
 	}
 
 	e := &Engine{
@@ -103,6 +127,8 @@ func NewEngine(store journal.Store, opts ...EngineOption) *Engine {
 		codec:              cfg.codec,
 		clock:              cfg.clock,
 		defaultRetryPolicy: cfg.defaultRetryPolicy,
+		workerConcurrency:  cfg.workerConcurrency,
+		logger:             cfg.logger,
 	}
 
 	if cfg.workflowResolver != nil {
@@ -121,7 +147,7 @@ func NewEngine(store journal.Store, opts ...EngineOption) *Engine {
 		e.activityRegistry = reg
 	}
 
-	return e
+	return e, nil
 }
 
 // registerWorkflow implements Registrar.
@@ -188,6 +214,7 @@ func (e *Engine) WorkflowWorker() *workflowWorker {
 		workerID:           e.workerID,
 		codec:              e.codec,
 		defaultRetryPolicy: e.defaultRetryPolicy,
+		logger:             e.logger,
 	}
 }
 
@@ -198,6 +225,7 @@ func (e *Engine) ActivityWorker() *activityWorker {
 		workerID: e.workerID,
 		codec:    e.codec,
 		clock:    e.clock,
+		logger:   e.logger,
 	}
 }
 
@@ -229,25 +257,42 @@ func (e *Engine) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	errc := make(chan error, 4)
+	type workerResult struct {
+		name string
+		err  error
+	}
 
-	go func() { errc <- RunWorker(ctx, e.WorkflowWorker()) }()
-	go func() { errc <- RunWorker(ctx, e.ActivityWorker()) }()
-	go func() { errc <- RunWorker(ctx, e.TimerWorker()) }()
-	go func() { errc <- RunWorker(ctx, e.TimeoutWorker()) }()
+	n := e.workerConcurrency
+	totalWorkers := n*2 + 2 // n workflow + n activity + 1 timer + 1 timeout
+	errc := make(chan workerResult, totalWorkers)
 
-	err := <-errc
+	for i := 0; i < n; i++ {
+		go func() { errc <- workerResult{"workflow", RunWorker(ctx, e.WorkflowWorker())} }()
+		go func() { errc <- workerResult{"activity", RunWorker(ctx, e.ActivityWorker())} }()
+	}
+	go func() { errc <- workerResult{"timer", RunWorker(ctx, e.TimerWorker())} }()
+	go func() { errc <- workerResult{"timeout", RunWorker(ctx, e.TimeoutWorker())} }()
+
+	result := <-errc
+	if result.err != nil {
+		e.logger.Error("derecho: worker exited with error",
+			"worker", result.name,
+			"error", result.err)
+	} else {
+		e.logger.Warn("derecho: worker exited unexpectedly",
+			"worker", result.name)
+	}
 	cancel()
 
 	// Drain remaining errors
-	<-errc
-	<-errc
-	<-errc
+	for i := 1; i < totalWorkers; i++ {
+		<-errc
+	}
 
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	return err
+	return result.err
 }
 
 // Actor returns execute and interrupt functions for use with run.Group.

@@ -14,8 +14,10 @@ type WorkflowStatus int
 const (
 	WorkflowStatusUnknown WorkflowStatus = iota
 	WorkflowStatusRunning
+	WorkflowStatusCancelling
 	WorkflowStatusCompleted
 	WorkflowStatusFailed
+	WorkflowStatusCancelled
 	WorkflowStatusTerminated
 	WorkflowStatusContinuedAsNew
 )
@@ -26,10 +28,14 @@ func (s WorkflowStatus) String() string {
 		return "unknown"
 	case WorkflowStatusRunning:
 		return "running"
+	case WorkflowStatusCancelling:
+		return "cancelling"
 	case WorkflowStatusCompleted:
 		return "completed"
 	case WorkflowStatusFailed:
 		return "failed"
+	case WorkflowStatusCancelled:
+		return "cancelled"
 	case WorkflowStatusTerminated:
 		return "terminated"
 	case WorkflowStatusContinuedAsNew:
@@ -65,7 +71,9 @@ type Store interface {
 	// is the next available (not necessarily ScheduledAt + 1, since completions
 	// may have been appended after scheduling).
 	WaitForWorkflowTasks(ctx context.Context, workerID string, maxNew int) ([]PendingWorkflowTask, error)
-	WaitForActivityTasks(ctx context.Context, workerID string) ([]PendingActivityTask, error)
+	// WaitForActivityTasks blocks until activity tasks are available, then claims
+	// up to maxActivities. Low values (e.g., 1) prevent one worker from starving others.
+	WaitForActivityTasks(ctx context.Context, workerID string, maxActivities int) ([]PendingActivityTask, error)
 	GetTimersToFire(ctx context.Context, now time.Time) ([]PendingTimerTask, error)
 	GetTimedOutActivities(ctx context.Context, now time.Time) ([]TimedOutActivity, error)
 	WaitForCompletion(ctx context.Context, workflowID, runID string) (Event, error)
@@ -84,10 +92,19 @@ type Store interface {
 	// Creates SignalReceived event and schedules a workflow task if needed.
 	SignalWorkflow(ctx context.Context, workflowID, signalName string, payload []byte) error
 
+	// CancelWorkflow requests cancellation of a running workflow.
+	// Appends WorkflowCancelRequested event and schedules a workflow task.
+	CancelWorkflow(ctx context.Context, workflowID, reason string) error
+
 	// CreateWorkflow initializes a new workflow execution.
 	// Generates run ID internally, appends WorkflowStarted and WorkflowTaskScheduled events.
 	// Returns the generated run ID.
+	// Returns ErrWorkflowAlreadyRunning if a workflow with this ID is already running.
 	CreateWorkflow(ctx context.Context, workflowID, workflowType string, input []byte, startedAt time.Time) (runID string, err error)
+
+	// ListWorkflows returns workflow executions matching the given options.
+	// Results ordered by created_at DESC (newest first).
+	ListWorkflows(ctx context.Context, opts ...ListWorkflowsOption) (*ListWorkflowsResult, error)
 }
 
 type RequeueInfo struct {
@@ -163,4 +180,104 @@ func WorkflowKey(workflowID, runID string) string {
 	return workflowID + "/" + runID
 }
 
-var ErrAlreadyProcessed = errors.New("derecho: workflow task already processed")
+var (
+	ErrAlreadyProcessed       = errors.New("derecho: workflow task already processed")
+	ErrWorkflowAlreadyRunning = errors.New("derecho: workflow already running")
+)
+
+type WorkflowExecution struct {
+	WorkflowID   string
+	RunID        string
+	WorkflowType string
+	Status       WorkflowStatus
+	CreatedAt    time.Time
+	CompletedAt  *time.Time
+	Input        []byte
+	Error        *Error // populated for failed workflows
+}
+
+type ListWorkflowsResult struct {
+	Executions []WorkflowExecution
+	NextCursor string // empty if no more results
+}
+
+type ListWorkflowsOption func(*ListWorkflowsOptions)
+
+type ListWorkflowsOptions struct {
+	WorkflowType string
+	Status       WorkflowStatus
+	WorkflowID   string
+	Limit        int
+	Cursor       string
+}
+
+func (o *ListWorkflowsOptions) ApplyDefaults() {
+	if o.Limit <= 0 {
+		o.Limit = 100
+	}
+	if o.Limit > 1000 {
+		o.Limit = 1000
+	}
+}
+
+func WithWorkflowType(t string) ListWorkflowsOption {
+	return func(o *ListWorkflowsOptions) { o.WorkflowType = t }
+}
+
+func WithStatus(s WorkflowStatus) ListWorkflowsOption {
+	return func(o *ListWorkflowsOptions) { o.Status = s }
+}
+
+func WithWorkflowID(id string) ListWorkflowsOption {
+	return func(o *ListWorkflowsOptions) { o.WorkflowID = id }
+}
+
+func WithLimit(n int) ListWorkflowsOption {
+	return func(o *ListWorkflowsOptions) { o.Limit = n }
+}
+
+func WithCursor(c string) ListWorkflowsOption {
+	return func(o *ListWorkflowsOptions) { o.Cursor = c }
+}
+
+type ListCursor struct {
+	CreatedAt  time.Time
+	WorkflowID string
+	RunID      string
+}
+
+func EncodeCursor(createdAt time.Time, workflowID, runID string) string {
+	return createdAt.Format(time.RFC3339Nano) + "|" + workflowID + "|" + runID
+}
+
+func DecodeCursor(cursor string) (ListCursor, error) {
+	if cursor == "" {
+		return ListCursor{}, nil
+	}
+	parts := splitCursor(cursor)
+	if len(parts) != 3 {
+		return ListCursor{}, errors.New("invalid cursor format")
+	}
+	t, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return ListCursor{}, errors.New("invalid cursor timestamp")
+	}
+	return ListCursor{
+		CreatedAt:  t,
+		WorkflowID: parts[1],
+		RunID:      parts[2],
+	}, nil
+}
+
+func splitCursor(s string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '|' {
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
+	}
+	parts = append(parts, s[start:])
+	return parts
+}

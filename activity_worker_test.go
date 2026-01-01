@@ -3,15 +3,27 @@ package derecho_test
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/atmonostorm/derecho"
 	"github.com/atmonostorm/derecho/journal"
 )
 
+func mustEngine(t *testing.T, store journal.Store, opts ...derecho.EngineOption) *derecho.Engine {
+	opts = append(opts, derecho.WithEngineLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	engine, err := derecho.NewEngine(store, opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine
+}
+
 func TestActivityWorker_ExecutesActivity(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	derecho.RegisterActivity(engine, "greet", func(ctx context.Context, name string) (string, error) {
 		return "Hello, " + name + "!", nil
@@ -57,7 +69,7 @@ func TestActivityWorker_ExecutesActivity(t *testing.T) {
 
 func TestActivityWorker_ActivityFails(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	derecho.RegisterActivity(engine, "fail", func(ctx context.Context, _ string) (string, error) {
 		return "", errors.New("intentional failure")
@@ -109,7 +121,7 @@ func TestActivityWorker_ActivityFails(t *testing.T) {
 
 func TestActivityWorker_UnregisteredActivity(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	activityRef := derecho.NewActivityRef[string, string]("unregistered")
 
@@ -122,28 +134,41 @@ func TestActivityWorker_UnregisteredActivity(t *testing.T) {
 	workflowWorker := engine.WorkflowWorker()
 	activityWorker := engine.ActivityWorker()
 
-	_, err := client.StartWorkflow(t.Context(), "uses-unregistered", "wf-1", "input")
+	run, err := client.StartWorkflow(t.Context(), "uses-unregistered", "wf-1", "input")
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	// Workflow schedules the unregistered activity
 	if err := workflowWorker.Process(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
-	err = activityWorker.Process(t.Context())
-	if err == nil {
-		t.Fatal("expected error for unregistered activity")
+	// Activity worker handles unregistered activity by failing it (not crashing)
+	if err := activityWorker.Process(t.Context()); err != nil {
+		t.Fatal("activity worker should not crash on unregistered activity:", err)
 	}
 
-	if err.Error() != "derecho: activity not registered: unregistered" {
+	// Workflow receives the failure and propagates it
+	if err := workflowWorker.Process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify workflow failed with the expected error
+	var result string
+	err = run.Get(t.Context(), &result)
+	if err == nil {
+		t.Fatal("expected workflow to fail")
+	}
+
+	if !strings.Contains(err.Error(), "activity not registered: unregistered") {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
 
 func TestActivityWorker_GetActivityInfo(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	var capturedInfo derecho.ActivityInfo
 
@@ -204,9 +229,130 @@ func TestActivityWorker_GetActivityInfo(t *testing.T) {
 	}
 }
 
+func TestClient_CancelWorkflow(t *testing.T) {
+	store := derecho.NewMemoryStore()
+	engine := mustEngine(t, store)
+
+	var gotCancelReason string
+	var workflowCancelled bool
+
+	derecho.RegisterWorkflow(engine, "cancellable", func(ctx derecho.Context, _ string) (string, error) {
+		info, _ := derecho.Cancelled(ctx).Get(ctx)
+		gotCancelReason = info.Reason
+		workflowCancelled = true
+		return "", derecho.ErrCancelled
+	})
+
+	client := engine.Client()
+	workflowWorker := engine.WorkflowWorker()
+
+	run, err := client.StartWorkflow(t.Context(), "cancellable", "wf-cancel-1", "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := workflowWorker.Process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if workflowCancelled {
+		t.Error("workflow should not be cancelled yet")
+	}
+
+	if err := client.CancelWorkflow(t.Context(), "wf-cancel-1", "user requested"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := workflowWorker.Process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !workflowCancelled {
+		t.Error("workflow should be cancelled")
+	}
+	if gotCancelReason != "user requested" {
+		t.Errorf("expected reason 'user requested', got %q", gotCancelReason)
+	}
+
+	var result string
+	err = run.Get(t.Context(), &result)
+	if !errors.Is(err, derecho.ErrCancelled) {
+		t.Errorf("expected ErrCancelled, got %v", err)
+	}
+}
+
+func TestClient_CancelWorkflowWithCleanup(t *testing.T) {
+	store := derecho.NewMemoryStore()
+	engine := mustEngine(t, store)
+
+	var cleanupExecuted bool
+
+	derecho.RegisterActivity(engine, "cleanup", func(ctx context.Context, _ string) (string, error) {
+		cleanupExecuted = true
+		return "cleaned up", nil
+	})
+
+	cleanupActivity := derecho.NewActivityRef[string, string]("cleanup")
+
+	derecho.RegisterWorkflow(engine, "cancellable-with-cleanup", func(ctx derecho.Context, _ string) (string, error) {
+		_, _ = derecho.Cancelled(ctx).Get(ctx)
+
+		future := cleanupActivity.Execute(ctx, "cleanup data")
+		_, err := future.Get(ctx)
+		if err != nil {
+			return "", err
+		}
+
+		return "", derecho.ErrCancelled
+	})
+
+	client := engine.Client()
+	workflowWorker := engine.WorkflowWorker()
+	activityWorker := engine.ActivityWorker()
+
+	run, err := client.StartWorkflow(t.Context(), "cancellable-with-cleanup", "wf-cleanup-1", "input")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := workflowWorker.Process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := client.CancelWorkflow(t.Context(), "wf-cleanup-1", "shutdown"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := workflowWorker.Process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if cleanupExecuted {
+		t.Error("cleanup should not be executed yet")
+	}
+
+	if err := activityWorker.Process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !cleanupExecuted {
+		t.Error("cleanup should be executed")
+	}
+
+	if err := workflowWorker.Process(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	var result string
+	err = run.Get(t.Context(), &result)
+	if !errors.Is(err, derecho.ErrCancelled) {
+		t.Errorf("expected ErrCancelled, got %v", err)
+	}
+}
+
 func TestActivityWorker_StructIO(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	type Input struct {
 		Name  string `json:"name"`

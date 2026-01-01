@@ -9,7 +9,7 @@ import (
 
 func TestEngine_SimpleWorkflow(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	derecho.RegisterWorkflow(engine, "greet", func(ctx derecho.Context, name string) (string, error) {
 		return "Hello, " + name + "!", nil
@@ -39,7 +39,7 @@ func TestEngine_SimpleWorkflow(t *testing.T) {
 
 func TestEngine_WorkflowWithActivity(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store)
+	engine := mustEngine(t, store)
 
 	activityRef := derecho.NewActivityRef[int, int]("double")
 
@@ -76,7 +76,7 @@ func TestEngine_WorkflowWithActivity(t *testing.T) {
 
 func TestEngine_WorkflowTaskEvents(t *testing.T) {
 	store := derecho.NewMemoryStore()
-	engine := derecho.NewEngine(store, derecho.WithWorkerID("test-worker"))
+	engine := mustEngine(t, store, derecho.WithWorkerID("test-worker"))
 
 	derecho.RegisterWorkflow(engine, "simple", func(ctx derecho.Context, input string) (string, error) {
 		return "done", nil

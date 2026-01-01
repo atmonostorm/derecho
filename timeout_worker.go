@@ -3,6 +3,7 @@ package derecho
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/atmonostorm/derecho/journal"
 )
@@ -22,6 +23,14 @@ func (w *timeoutWorker) Process(ctx context.Context) error {
 	for _, to := range timedOut {
 		if err := w.processTimeout(ctx, to); err != nil {
 			return err
+		}
+	}
+
+	if len(timedOut) == 0 {
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	return nil

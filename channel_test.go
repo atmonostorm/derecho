@@ -496,7 +496,7 @@ func TestChannel_SchedulerDeterminism(t *testing.T) {
 
 func TestChannel_HighConcurrencyReplay(t *testing.T) {
 	store := NewMemoryStore()
-	engine := NewEngine(store)
+	engine := mustEngine(t, store)
 
 	channelWorkflow := func(ctx Context, _ struct{}) ([]int, error) {
 		const numProducers = 5

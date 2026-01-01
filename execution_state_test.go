@@ -60,7 +60,7 @@ func (s *minimalStore) WaitForWorkflowTasks(ctx context.Context, workerID string
 	return nil, nil
 }
 
-func (s *minimalStore) WaitForActivityTasks(ctx context.Context, workerID string) ([]journal.PendingActivityTask, error) {
+func (s *minimalStore) WaitForActivityTasks(ctx context.Context, workerID string, maxActivities int) ([]journal.PendingActivityTask, error) {
 	return nil, nil
 }
 
@@ -96,12 +96,20 @@ func (s *minimalStore) CreateWorkflow(ctx context.Context, workflowID, workflowT
 	return "test-run", nil
 }
 
+func (s *minimalStore) CancelWorkflow(ctx context.Context, workflowID, reason string) error {
+	return nil
+}
+
+func (s *minimalStore) ListWorkflows(ctx context.Context, opts ...journal.ListWorkflowsOption) (*journal.ListWorkflowsResult, error) {
+	return &journal.ListWorkflowsResult{}, nil
+}
+
 func TestExecutionHistory_FreshExecution(t *testing.T) {
 	store := newMinimalStore()
 	h := newExecutionState("wf-1", "run-1", nil, store)
 
 	r := h.NewRecorder(0)
-	recorded, err := r.Record(journal.TypeActivityScheduled, func() journal.Event {
+	recorded, _, err := r.Record(journal.TypeActivityScheduled, func() journal.Event {
 		return journal.ActivityScheduled{}
 	})
 	if err != nil {
@@ -138,7 +146,7 @@ func TestExecutionHistory_ReplayThenNew(t *testing.T) {
 	h := newExecutionState("wf-1", "run-1", preloaded, store)
 
 	r := h.NewRecorder(0)
-	recorded, err := r.Record(journal.TypeActivityScheduled, func() journal.Event {
+	recorded, _, err := r.Record(journal.TypeActivityScheduled, func() journal.Event {
 		return journal.ActivityScheduled{}
 	})
 	if err != nil {
@@ -152,7 +160,7 @@ func TestExecutionHistory_ReplayThenNew(t *testing.T) {
 		t.Errorf("expected 0 pending during replay, got %d", r.PendingCount())
 	}
 
-	recorded, err = r.Record(journal.TypeWorkflowCompleted, func() journal.Event {
+	recorded, _, err = r.Record(journal.TypeWorkflowCompleted, func() journal.Event {
 		return journal.WorkflowCompleted{}
 	})
 	if err != nil {
@@ -185,7 +193,7 @@ func TestExecutionHistory_NondeterminismDetection(t *testing.T) {
 	h := newExecutionState("wf-1", "run-1", preloaded, store)
 
 	r := h.NewRecorder(0)
-	_, err := r.Record(journal.TypeWorkflowCompleted, func() journal.Event {
+	_, _, err := r.Record(journal.TypeWorkflowCompleted, func() journal.Event {
 		return journal.WorkflowCompleted{}
 	})
 
@@ -226,32 +234,44 @@ func TestExecutionHistory_GetByScheduledID(t *testing.T) {
 }
 
 func TestExecutionHistory_VisibilityBoundary(t *testing.T) {
+	// Visibility is set by NewRecorder based on WorkflowTaskStarted for the current task.
+	// Events with ID <= WorkflowTaskStarted.ID are visible during replay.
 	preloaded := []journal.Event{
-		journal.ActivityScheduled{BaseEvent: journal.BaseEvent{ID: 1}},
-		journal.ActivityCompleted{BaseEvent: journal.BaseEvent{ID: 2, ScheduledByID: 1}},
+		journal.WorkflowTaskScheduled{BaseEvent: journal.BaseEvent{ID: 1}},
+		journal.WorkflowTaskStarted{BaseEvent: journal.BaseEvent{ID: 2, ScheduledByID: 1}},
 		journal.ActivityScheduled{BaseEvent: journal.BaseEvent{ID: 3}},
 		journal.ActivityCompleted{BaseEvent: journal.BaseEvent{ID: 4, ScheduledByID: 3}},
+		journal.WorkflowTaskCompleted{BaseEvent: journal.BaseEvent{ID: 5, ScheduledByID: 1}},
+		// Another completion arrives after task 1 completed, then new task
+		journal.ActivityCompleted{BaseEvent: journal.BaseEvent{ID: 6, ScheduledByID: 3}},
+		journal.WorkflowTaskScheduled{BaseEvent: journal.BaseEvent{ID: 7}},
+		journal.WorkflowTaskStarted{BaseEvent: journal.BaseEvent{ID: 8, ScheduledByID: 7}},
 	}
 
 	store := newMinimalStore()
 	h := newExecutionState("wf-1", "run-1", preloaded, store)
 
+	// Initially visibility is at lastEventID (8)
 	results := h.GetByScheduledID(3)
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result initially, got %d", len(results))
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results initially, got %d", len(results))
 	}
 
-	r := h.NewRecorder(0)
-	_, err := r.Record(journal.TypeActivityScheduled, func() journal.Event {
-		return journal.ActivityScheduled{}
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	// NewRecorder for task scheduled at ID=1 sets visibility to WorkflowTaskStarted ID=2
+	// At that point, ActivityCompleted(4) and ActivityCompleted(6) didn't exist yet
+	h.NewRecorder(1)
 	results = h.GetByScheduledID(3)
 	if len(results) != 0 {
-		t.Errorf("expected 0 results after visibility moved, got %d", len(results))
+		t.Errorf("expected 0 results for task 1 (visibility=2, completions at 4,6), got %d", len(results))
+	}
+
+	// NewRecorder for task scheduled at ID=7 sets visibility to WorkflowTaskStarted ID=8
+	// At that point, both completions existed
+	h2 := newExecutionState("wf-1", "run-1", preloaded, store)
+	h2.NewRecorder(7)
+	results = h2.GetByScheduledID(3)
+	if len(results) != 2 {
+		t.Errorf("expected 2 results for task 7 (visibility=8, completions at 4,6), got %d", len(results))
 	}
 }
 
@@ -260,7 +280,7 @@ func TestExecutionHistory_AddEvents(t *testing.T) {
 	h := newExecutionState("wf-1", "run-1", nil, store)
 
 	r := h.NewRecorder(0)
-	r.Record(journal.TypeActivityScheduled, func() journal.Event {
+	_, _, _ = r.Record(journal.TypeActivityScheduled, func() journal.Event {
 		return journal.ActivityScheduled{}
 	})
 	r.Commit(context.Background(), 0)
@@ -289,7 +309,7 @@ func TestRecorder_GenerateNotCalledDuringReplay(t *testing.T) {
 
 	called := false
 	r := h.NewRecorder(0)
-	_, err := r.Record(journal.TypeActivityScheduled, func() journal.Event {
+	_, _, err := r.Record(journal.TypeActivityScheduled, func() journal.Event {
 		called = true
 		return journal.ActivityScheduled{}
 	})

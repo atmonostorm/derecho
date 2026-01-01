@@ -68,13 +68,18 @@ func Sleep(ctx Context, d time.Duration) {
 // NewTimer schedules a timer that fires after duration d.
 // Returns a Future that resolves to the time when the timer fired.
 func NewTimer(ctx Context, d time.Duration) Future[time.Time] {
-	ts, ok := ctx.(timerScheduler)
+	wctx, ok := ctx.(interface {
+		timerScheduler
+		futureRegistrar
+	})
 	if !ok {
 		panic(panicOutsideWorkflow)
 	}
-	fireAt := ts.workflowTime().Add(d)
-	scheduledID := ts.emitTimerScheduled(d, fireAt)
-	return newTimerFuture(scheduledID)
+	fireAt := wctx.workflowTime().Add(d)
+	scheduledID, pendingIndex := wctx.emitTimerScheduled(d, fireAt)
+	future := newTimerFuture(scheduledID)
+	wctx.registerPendingFuture(pendingIndex, future)
+	return future
 }
 
 // ErrTimerCancelled is returned by Future.Get when the timer was cancelled.
@@ -159,7 +164,7 @@ func SideEffect[T any](ctx Context, fn func() T) T {
 	rec := rcp.recorder()
 	codec := rcp.codec()
 
-	recorded, err := rec.Record(journal.TypeSideEffectRecorded, func() journal.Event {
+	recorded, _, err := rec.Record(journal.TypeSideEffectRecorded, func() journal.Event {
 		result := fn()
 		encoded, encErr := codec.Encode(result)
 		if encErr != nil {

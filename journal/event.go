@@ -7,9 +7,11 @@ import (
 
 // Event type constants.
 const (
-	TypeWorkflowStarted   = "workflow_started"
-	TypeWorkflowFailed    = "workflow_failed"
-	TypeWorkflowCompleted = "workflow_completed"
+	TypeWorkflowStarted         = "workflow_started"
+	TypeWorkflowFailed          = "workflow_failed"
+	TypeWorkflowCompleted       = "workflow_completed"
+	TypeWorkflowCancelRequested = "workflow_cancel_requested"
+	TypeWorkflowCancelled       = "workflow_cancelled"
 
 	TypeWorkflowTaskScheduled = "workflow_task_scheduled"
 	TypeWorkflowTaskStarted   = "workflow_task_started"
@@ -106,6 +108,44 @@ func (e WorkflowFailed) WithID(id int) Event {
 }
 
 func (e WorkflowFailed) WithScheduledByID(id int) Event {
+	e.ScheduledByID = id
+	return e
+}
+
+type WorkflowCancelRequested struct {
+	BaseEvent
+	Reason        string        `json:"reason,omitempty"`
+	RequestedAt   time.Time     `json:"requested_at"`
+	CancelTimeout time.Duration `json:"cancel_timeout,omitempty"`
+}
+
+func (WorkflowCancelRequested) EventType() string { return TypeWorkflowCancelRequested }
+
+func (e WorkflowCancelRequested) WithID(id int) Event {
+	e.ID = id
+	return e
+}
+
+func (e WorkflowCancelRequested) WithScheduledByID(id int) Event {
+	e.ScheduledByID = id
+	return e
+}
+
+type WorkflowCancelled struct {
+	BaseEvent
+	Forced          bool   `json:"forced,omitempty"`
+	RemainingFibers int    `json:"remaining_fibers,omitempty"`
+	Error           *Error `json:"error,omitempty"`
+}
+
+func (WorkflowCancelled) EventType() string { return TypeWorkflowCancelled }
+
+func (e WorkflowCancelled) WithID(id int) Event {
+	e.ID = id
+	return e
+}
+
+func (e WorkflowCancelled) WithScheduledByID(id int) Event {
 	e.ScheduledByID = id
 	return e
 }
@@ -428,6 +468,7 @@ const (
 	ErrorKindApplication    ErrorKind = "application"
 	ErrorKindTimeout        ErrorKind = "timeout"
 	ErrorKindCancelled      ErrorKind = "cancelled"
+	ErrorKindCancelTimeout  ErrorKind = "cancel_timeout"
 	ErrorKindNondeterminism ErrorKind = "nondeterminism"
 	ErrorKindPanic          ErrorKind = "panic"
 )

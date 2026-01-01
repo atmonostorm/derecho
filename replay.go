@@ -49,7 +49,7 @@ type ReplayResult struct {
 	// Empty for complete workflows replayed deterministically.
 	NewEvents []journal.Event
 
-	// Complete is true if the workflow reached WorkflowCompleted or WorkflowFailed.
+	// Complete is true if the workflow reached a terminal state (Completed, Failed, or Cancelled).
 	Complete bool
 
 	// Result is the JSON-encoded result if Complete is true and workflow succeeded.
@@ -98,6 +98,9 @@ func ReplayWithResult(workflowFn any, events []journal.Event) (*ReplayResult, er
 		case journal.WorkflowFailed:
 			result.Complete = true
 			result.Error = e.Error
+		case journal.WorkflowCancelled:
+			result.Complete = true
+			result.Error = ErrCancelled
 		}
 	}
 

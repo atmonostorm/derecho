@@ -68,6 +68,10 @@ func unmarshalEvent(data []byte) (Event, error) {
 		ev = &WorkflowCompleted{}
 	case TypeWorkflowFailed:
 		ev = &WorkflowFailed{}
+	case TypeWorkflowCancelRequested:
+		ev = &WorkflowCancelRequested{}
+	case TypeWorkflowCancelled:
+		ev = &WorkflowCancelled{}
 	case TypeWorkflowTaskScheduled:
 		ev = &WorkflowTaskScheduled{}
 	case TypeWorkflowTaskStarted:
@@ -119,6 +123,10 @@ func unmarshalEvent(data []byte) (Event, error) {
 	case *WorkflowCompleted:
 		return *e, nil
 	case *WorkflowFailed:
+		return *e, nil
+	case *WorkflowCancelRequested:
+		return *e, nil
+	case *WorkflowCancelled:
 		return *e, nil
 	case *WorkflowTaskScheduled:
 		return *e, nil

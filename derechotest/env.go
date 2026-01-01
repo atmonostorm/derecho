@@ -2,11 +2,18 @@ package derechotest
 
 import (
 	"encoding/json"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/atmonostorm/derecho"
 )
+
+// TestLogger returns a logger that discards all output, for use in tests.
+func TestLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
 // activityAttemptState tracks retry state for a scheduled activity.
 type activityAttemptState struct {

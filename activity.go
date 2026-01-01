@@ -9,7 +9,7 @@ import (
 )
 
 type activityEventEmitter interface {
-	emitActivityScheduled(name string, input []byte, retryPolicy *journal.RetryPolicyPayload, timeoutPolicy *journal.TimeoutPolicyPayload) int
+	emitActivityScheduled(name string, input []byte, retryPolicy *journal.RetryPolicyPayload, timeoutPolicy *journal.TimeoutPolicyPayload) (id int, newEventIndex int)
 }
 
 type activityOptions struct {
@@ -166,6 +166,7 @@ func (r ActivityRef[I, O]) Execute(ctx Context, input I, opts ...ActivityOption)
 	wctx, ok := ctx.(interface {
 		activityEventEmitter
 		codecProvider
+		futureRegistrar
 	})
 	if !ok {
 		panic(panicOutsideWorkflow)
@@ -196,6 +197,8 @@ func (r ActivityRef[I, O]) Execute(ctx Context, input I, opts ...ActivityOption)
 		return newFailedFuture[O](fmt.Errorf("encode activity input for %q: %w", r.name, err))
 	}
 
-	scheduledID := wctx.emitActivityScheduled(r.name, inputJSON, retryPayload, timeoutPayload)
-	return newActivityFuture[O](scheduledID, codec)
+	scheduledID, pendingIndex := wctx.emitActivityScheduled(r.name, inputJSON, retryPayload, timeoutPayload)
+	future := &activityFuture[O]{scheduledID: scheduledID, codec: codec}
+	wctx.registerPendingFuture(pendingIndex, future)
+	return future
 }

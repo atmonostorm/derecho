@@ -49,8 +49,13 @@ func (c *schedulerCache) Get(workflowID, runID string) *cachedScheduler {
 	if !ok {
 		return nil
 	}
-	c.lru.MoveToFront(entry.element)
-	return entry.cs
+
+	// Remove from cache to prevent eviction while in use.
+	// Caller must Put() when done to re-add to cache.
+	cs := entry.cs
+	c.lru.Remove(entry.element)
+	delete(c.entries, key)
+	return cs
 }
 
 // Put adds or updates a cached scheduler. Returns false if the cache is full

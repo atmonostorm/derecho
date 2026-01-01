@@ -7,7 +7,7 @@ import (
 )
 
 type childWorkflowEventEmitter interface {
-	emitChildWorkflowScheduled(workflowType, workflowID string, input []byte, closePolicy journal.ParentClosePolicy) int
+	emitChildWorkflowScheduled(workflowType, workflowID string, input []byte, closePolicy journal.ParentClosePolicy) (id int, newEventIndex int)
 }
 
 type childWorkflowOptions struct {
@@ -38,6 +38,7 @@ func (r ChildWorkflowRef[I, O]) Execute(ctx Context, workflowID string, input I,
 	wctx, ok := ctx.(interface {
 		childWorkflowEventEmitter
 		codecProvider
+		futureRegistrar
 	})
 	if !ok {
 		panic(panicOutsideWorkflow)
@@ -54,8 +55,10 @@ func (r ChildWorkflowRef[I, O]) Execute(ctx Context, workflowID string, input I,
 		return newFailedFuture[O](fmt.Errorf("encode child workflow input for %q: %w", r.name, err))
 	}
 
-	scheduledID := wctx.emitChildWorkflowScheduled(r.name, workflowID, inputJSON, options.closePolicy)
-	return newChildWorkflowFuture[O](scheduledID, codec)
+	scheduledID, pendingIndex := wctx.emitChildWorkflowScheduled(r.name, workflowID, inputJSON, options.closePolicy)
+	future := newChildWorkflowFuture[O](scheduledID, codec)
+	wctx.registerPendingFuture(pendingIndex, future)
+	return future
 }
 
 type childWorkflowFuture[T any] struct {
@@ -66,7 +69,11 @@ type childWorkflowFuture[T any] struct {
 	done        bool
 }
 
-func newChildWorkflowFuture[T any](scheduledID int, codec Codec) Future[T] {
+func (f *childWorkflowFuture[T]) SetScheduledID(id int) {
+	f.scheduledID = id
+}
+
+func newChildWorkflowFuture[T any](scheduledID int, codec Codec) *childWorkflowFuture[T] {
 	return &childWorkflowFuture[T]{scheduledID: scheduledID, codec: codec}
 }
 
